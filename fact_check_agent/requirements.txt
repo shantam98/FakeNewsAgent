@@ -1,0 +1,24 @@
+# LangGraph / LangChain
+langgraph>=0.2
+langchain>=0.3
+langchain-openai>=0.2
+langsmith>=0.1
+
+# LLM
+openai>=1.40
+
+# Search
+tavily-python>=0.3
+
+# Cross-modal CLIP (SOTA — not used in baseline, ready to enable)
+transformers>=4.40
+torch>=2.2
+Pillow>=10.0
+
+# Data / Config
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# Benchmarking
+pandas>=2.0
+scikit-learn>=1.4
