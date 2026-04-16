@@ -1,22 +1,44 @@
 """Settings for the Fact-Check Agent.
 
-Extends memory_agent's Settings with LangSmith tracing fields.
-The memory_agent path is bootstrapped here so all downstream imports work.
+Standalone pydantic-settings config — all fields declared here directly.
+Memory-agent's Settings is no longer inherited to avoid the bare-`src`
+namespace collision between fact_check_agent/src and memory_agent/src.
 """
-from src._bootstrap import *  # noqa: F401,F403 — sets up sys.path for memory_agent
-
-from pydantic_settings import SettingsConfigDict
-from src.config import Settings as _MemorySettings  # memory_agent's Settings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(_MemorySettings):
+class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # LangSmith / Langfuse tracing
+    # Neo4j Aura (passed through to MemoryAgent at runtime)
+    neo4j_uri: str = ""
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+
+    # ChromaDB Cloud (passed through to MemoryAgent at runtime)
+    chroma_api_key: str = ""
+    chroma_tenant: str = ""
+    chroma_database: str = ""
+
+    # OpenAI
+    openai_api_key: str = ""
+
+    # Tavily Search API
+    tavily_api_key: str = ""
+
+    # Telegram scraper (unused by fact_check_agent — kept for MemoryAgent parity)
+    telegram_scraper_api_url: str = ""
+    telegram_scraper_api_key: str = ""
+
+    # Model settings
+    embedding_model: str = "text-embedding-3-small"
+    llm_model: str = "gpt-4o"
+
+    # LangSmith tracing
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
     langchain_project: str = "fakenews-factcheck"

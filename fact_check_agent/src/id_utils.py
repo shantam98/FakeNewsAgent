@@ -1,10 +1,18 @@
-"""Re-export make_id from memory_agent.
+"""ID generation utilities — matches memory_agent's id_utils exactly."""
+import hashlib
+import uuid
 
-Bootstrap must run before this import, which is guaranteed by importing
-config (or _bootstrap) first in any entry point.
-"""
-from src._bootstrap import *  # noqa: F401,F403
 
-from src.id_utils import make_id  # memory_agent's id_utils
+def make_id(prefix: str) -> str:
+    """Generate a random ID with a type prefix.
 
-__all__ = ["make_id"]
+    Examples: vrd_a3f8b2c1d4e5, clm_7d2e9f01b3c4
+    """
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
+
+
+def make_entity_id(name: str, entity_type: str) -> str:
+    """Generate a deterministic entity ID from name + type."""
+    key = f"{name.strip().lower()}|{entity_type.strip().lower()}"
+    hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return f"ent_{hash_hex}"
