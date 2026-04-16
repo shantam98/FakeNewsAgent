@@ -1,5 +1,11 @@
-"""Baseline RAG agent — retrieves similar claims and verdicts from MemoryAgent."""
+"""RAG tool — retrieves similar claims and their verdicts from MemoryAgent.
+
+This is a tool, not an agent: it makes direct database calls (ChromaDB vector
+search + ChromaDB verdict lookup) and returns structured results. No LLM call,
+no loops, no planning.
+"""
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,7 +18,7 @@ def retrieve_similar_claims(claim_text: str, memory: "MemoryAgent", top_k: int =
     """Query ChromaDB for semantically similar past claims and their verdicts.
 
     Returns a list of dicts with keys:
-        claim_id, claim_text, verdict_label, verdict_confidence, distance
+        claim_id, claim_text, verdict_label, verdict_confidence, distance, verified_at
     """
     raw = memory.search_similar_claims(claim_text, top_k=top_k)
 
@@ -28,22 +34,32 @@ def retrieve_similar_claims(claim_text: str, memory: "MemoryAgent", top_k: int =
     for i, claim_id in enumerate(ids):
         verdict_label      = None
         verdict_confidence = None
+        verified_at        = None
 
         verdict_raw = memory.get_verdict_by_claim(claim_id)
         if verdict_raw.get("metadatas") and verdict_raw["metadatas"]:
             meta = verdict_raw["metadatas"][0]
             verdict_label      = meta.get("label")
             verdict_confidence = meta.get("confidence")
+            raw_ts = meta.get("verified_at")
+            if raw_ts:
+                try:
+                    verified_at = datetime.fromisoformat(raw_ts)
+                    if verified_at.tzinfo is None:
+                        verified_at = verified_at.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    verified_at = None
 
         results.append({
-            "claim_id":          claim_id,
-            "claim_text":        docs[i],
-            "verdict_label":     verdict_label,
+            "claim_id":           claim_id,
+            "claim_text":         docs[i],
+            "verdict_label":      verdict_label,
             "verdict_confidence": float(verdict_confidence) if verdict_confidence is not None else None,
-            "distance":          float(distances[i]),
+            "distance":           float(distances[i]),
+            "verified_at":        verified_at,
         })
 
-    logger.debug("RAG retrieved %d similar claims", len(results))
+    logger.debug("RAG tool retrieved %d similar claims", len(results))
     return results
 
 

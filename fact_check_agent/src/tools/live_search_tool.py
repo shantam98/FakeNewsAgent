@@ -1,4 +1,12 @@
-"""Baseline live search agent — queries Tavily for current evidence."""
+"""Live search tool — queries Tavily for current web evidence about a claim.
+
+This is a tool, not an agent: it makes a single Tavily API call (with one
+automatic retry for source diversity) and returns structured results.
+No LLM call, no planning.
+
+Tuning surface:
+  - _MIN_DISTINCT_DOMAINS: minimum number of distinct source domains required
+"""
 import logging
 
 from tavily import TavilyClient
@@ -11,14 +19,13 @@ _MIN_DISTINCT_DOMAINS = 3
 def search_live(claim_text: str, api_key: str, max_results: int = 5) -> list[dict]:
     """Search Tavily for evidence about the claim.
 
-    Enforces a minimum of 3 distinct source domains.
-    Falls back to a broader query if the first pass returns fewer.
+    Enforces a minimum of _MIN_DISTINCT_DOMAINS distinct source domains.
+    Retries with a broader query if the first pass returns fewer.
     """
     client = TavilyClient(api_key=api_key)
 
     results = _run_search(client, claim_text, max_results)
 
-    # Retry with broader query if not enough distinct domains
     distinct_domains = _count_distinct_domains(results)
     if distinct_domains < _MIN_DISTINCT_DOMAINS:
         broader_query = f"fact check: {claim_text}"
@@ -27,7 +34,7 @@ def search_live(claim_text: str, api_key: str, max_results: int = 5) -> list[dic
         )
         results = _run_search(client, broader_query, max_results + 3)
 
-    logger.info("Live search returned %d results for claim: %s", len(results), claim_text[:60])
+    logger.info("Live search tool returned %d results for claim: %s", len(results), claim_text[:60])
     return results
 
 

@@ -57,6 +57,8 @@ class FactCheckOutput(BaseModel):
     bias_score: float = Field(ge=0.0, le=1.0)
     cross_modal_flag: bool = False
     cross_modal_explanation: Optional[str] = None  # one sentence; None if no image or no conflict
+    last_verified_at: Optional[datetime] = None    # populated on cache hits; None on live-search path
+    revalidation_needed: bool = False              # True if freshness_check decided live re-check is required
 
 
 # ── Memory query types ────────────────────────────────────────────────────────
@@ -67,6 +69,7 @@ class SimilarClaim(BaseModel):
     verdict_label: Optional[str] = None       # None if claim has no verdict yet
     verdict_confidence: Optional[float] = None
     distance: float                            # ChromaDB cosine distance; lower = more similar
+    verified_at: Optional[datetime] = None    # when this verdict was last written to memory
 
 
 class MemoryQueryRequest(BaseModel):

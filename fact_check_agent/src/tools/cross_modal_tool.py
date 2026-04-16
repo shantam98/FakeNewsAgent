@@ -1,6 +1,15 @@
-"""Baseline cross-modal consistency check — LLM prompt only.
+"""Cross-modal consistency tool — checks for conflicts between claim text and image caption.
+
+This is a tool, not an agent: it makes a single LLM call (and optionally a
+CLIP similarity computation) and returns a structured result. No loops,
+no follow-up actions.
 
 SOTA extension (CLIP scoring) is stubbed out and gated by a feature flag.
+
+Tuning surface:
+  - ENABLE_CLIP: set True to add CLIP cosine similarity alongside the LLM check
+  - CLIP_THRESHOLD: similarity scores below this are treated as a conflict
+  - CROSS_MODAL_PROMPT in prompts.py: adjust what counts as a conflict
 """
 import json
 import logging

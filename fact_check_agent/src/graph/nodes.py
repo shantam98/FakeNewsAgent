@@ -11,9 +11,14 @@ from typing import TYPE_CHECKING, Optional
 
 from openai import OpenAI
 
-from fact_check_agent.src.agents.cross_modal_agent import check_cross_modal
-from fact_check_agent.src.agents.live_search_agent import format_search_context, search_live
-from fact_check_agent.src.agents.rag_agent import format_rag_context, retrieve_similar_claims
+from fact_check_agent.src.agents.reflection_agent import (
+    query_source_credibility,
+    update_source_credibility,
+)
+from fact_check_agent.src.tools.cross_modal_tool import check_cross_modal
+from fact_check_agent.src.tools.freshness_tool import check_freshness
+from fact_check_agent.src.tools.live_search_tool import format_search_context, search_live
+from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
 from fact_check_agent.src.models.schemas import (
     FactCheckOutput,
     MemoryQueryResponse,
@@ -41,12 +46,15 @@ def receive_claim(state: FactCheckState) -> dict:
         "memory_results":          None,
         "entity_context":          [],
         "route":                   None,
+        "revalidation_needed":     None,
         "retrieved_chunks":        [],
         "sub_claims":              [],
         "debate_transcript":       None,
+        "source_credibility":      None,
         "cross_modal_flag":        False,
         "cross_modal_explanation": None,
         "clip_similarity_score":   None,
+        "last_verified_at":        None,
         "output":                  None,
     }
 
@@ -62,11 +70,12 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
 
     results = [
         SimilarClaim(
-            claim_id          = c["claim_id"],
-            claim_text        = c["claim_text"],
-            verdict_label     = c.get("verdict_label"),
-            verdict_confidence= c.get("verdict_confidence"),
-            distance          = c["distance"],
+            claim_id           = c["claim_id"],
+            claim_text         = c["claim_text"],
+            verdict_label      = c.get("verdict_label"),
+            verdict_confidence = c.get("verdict_confidence"),
+            distance           = c["distance"],
+            verified_at        = c.get("verified_at"),
         )
         for c in similar
     ]
@@ -76,14 +85,29 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
         default=0.0,
     )
 
+    # Surface the verified_at of the best (highest-confidence) result for freshness_check
+    best = next((r for r in results if r.verdict_confidence == max_confidence and r.verified_at), None)
+    last_verified_at = best.verified_at if best else None
+
+    # Query Reflection Agent for (source, topic) credibility history
+    source_cred = query_source_credibility(
+        claim_text = inp.claim_text,
+        source_url = inp.source_url,
+        memory     = memory,
+    )
+
     logger.info(
-        "query_memory: %d similar claims, max_confidence=%.2f, %d entities",
+        "query_memory: %d similar claims, max_confidence=%.2f, %d entities, "
+        "source_cred_samples=%d",
         len(results), max_confidence, len(entity_ctx),
+        source_cred.get("sample_count", 0),
     )
 
     return {
-        "memory_results": MemoryQueryResponse(results=results, max_confidence=max_confidence),
-        "entity_context": entity_ctx,
+        "memory_results":    MemoryQueryResponse(results=results, max_confidence=max_confidence),
+        "entity_context":    entity_ctx,
+        "last_verified_at":  last_verified_at,
+        "source_credibility": source_cred,
     }
 
 
@@ -103,6 +127,39 @@ def return_cached(state: FactCheckState) -> dict:
     )
     logger.info("Cache hit path triggered")
     return {"retrieved_chunks": [chunk], "route": "cache"}
+
+
+# ── Node: freshness_check ────────────────────────────────────────────────────
+
+def freshness_check(state: FactCheckState, settings) -> dict:
+    """LLM-based classifier: should the cached verdict be re-verified via live search?
+
+    Only runs on the cache path (confidence >= CACHE_CONFIDENCE_THRESHOLD).
+    If last_verified_at is unavailable, defaults to revalidate=True (safe fallback).
+    Result is stored in state so the freshness_router can route accordingly.
+    """
+    last_verified_at = state.get("last_verified_at")
+    if not last_verified_at:
+        logger.info("freshness_check: no verified_at timestamp — defaulting to revalidate")
+        return {"revalidation_needed": True}
+
+    memory_results = state["memory_results"]
+    best = next(
+        (r for r in memory_results.results if r.verdict_label and r.verified_at),
+        None,
+    )
+    if not best:
+        return {"revalidation_needed": True}
+
+    result = check_freshness(
+        claim_text         = state["input"].claim_text,
+        verdict_label      = best.verdict_label,
+        verdict_confidence = best.verdict_confidence or 0.0,
+        last_verified_at   = last_verified_at,
+        api_key            = settings.openai_api_key,
+        model              = settings.llm_model,
+    )
+    return {"revalidation_needed": result["revalidate"]}
 
 
 # ── Node: live_search ─────────────────────────────────────────────────────────
@@ -136,6 +193,28 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
 
     # Build source credibility note
     cred_lines = [f"Source: {inp.source_url}"]
+
+    # Topic-conditioned source credibility from Reflection Agent
+    sc = state.get("source_credibility") or {}
+    cred_mean    = sc.get("credibility_mean")
+    bias_mean    = sc.get("bias_mean")
+    bias_std     = sc.get("bias_std")
+    sample_count = sc.get("sample_count", 0)
+
+    if cred_mean is not None and sample_count >= 2:
+        cred_lines.append(
+            f"Source credibility for this topic: {cred_mean:.0%} "
+            f"(based on {sample_count} past verdicts)"
+        )
+        cred_lines.append(
+            f"Source bias for this topic: {bias_mean:.2f} ± {bias_std:.2f} "
+            f"(0.0 = unbiased, 1.0 = highly biased; high std = inconsistent source)"
+        )
+    elif sample_count == 1:
+        cred_lines.append("Source credibility: only 1 prior verdict — insufficient for reliable estimate")
+    else:
+        cred_lines.append("Source credibility: no prior verdicts for this source")
+
     if state["entity_context"]:
         cred_lines.append("Entity credibility context:")
         for e in state["entity_context"]:
@@ -257,13 +336,32 @@ def write_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
 
     memory.add_verdict(verdict)
     logger.info("write_memory: verdict %s written for claim %s", output.verdict, output.claim_id)
+
+    # Reflection Agent: append one (source, topic, credibility, bias) observation
+    update_source_credibility(
+        claim_text      = state["input"].claim_text,
+        source_url      = state["input"].source_url,
+        verdict_id      = output.verdict_id,
+        verdict_label   = output.verdict,
+        confidence_score= output.confidence_score,
+        bias_score      = output.bias_score,
+        memory          = memory,
+    )
+
     return {}
 
 
 # ── Node: emit_output ─────────────────────────────────────────────────────────
 
 def emit_output(state: FactCheckState) -> dict:
-    """Terminal node — output already set; validates it is populated."""
-    if not state.get("output"):
+    """Terminal node — stamps freshness metadata onto the output before returning."""
+    current_output: Optional[FactCheckOutput] = state.get("output")
+    if not current_output:
         logger.error("emit_output reached with no output in state")
-    return {}
+        return {}
+
+    updated = current_output.model_copy(update={
+        "last_verified_at":    state.get("last_verified_at"),
+        "revalidation_needed": bool(state.get("revalidation_needed")),
+    })
+    return {"output": updated}

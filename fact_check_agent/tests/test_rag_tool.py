@@ -1,7 +1,7 @@
-"""Tests for the RAG agent — no API keys or database required."""
+"""Tests for the RAG tool — no API keys or database required."""
 from unittest.mock import MagicMock
 
-from fact_check_agent.src.agents.rag_agent import format_rag_context, retrieve_similar_claims
+from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

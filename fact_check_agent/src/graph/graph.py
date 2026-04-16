@@ -18,6 +18,7 @@ from fact_check_agent.src.config import settings
 from fact_check_agent.src.graph.nodes import (
     cross_modal_check,
     emit_output,
+    freshness_check,
     live_search,
     multi_agent_debate,
     query_memory,
@@ -27,7 +28,7 @@ from fact_check_agent.src.graph.nodes import (
     synthesize_verdict,
     write_memory,
 )
-from fact_check_agent.src.graph.router import debate_check, router
+from fact_check_agent.src.graph.router import debate_check, freshness_router, router
 from fact_check_agent.src.models.state import FactCheckState
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ def build_graph(memory: "MemoryAgent"):
     """
     # Bind memory and settings into nodes that need them via closures
     def _query_memory(state):      return query_memory(state, memory)
+    def _freshness_check(state):   return freshness_check(state, settings)
     def _live_search(state):       return live_search(state, settings)
     def _synthesize_verdict(state):return synthesize_verdict(state, settings)
     def _multi_agent_debate(state):return multi_agent_debate(state, settings)
@@ -59,6 +61,7 @@ def build_graph(memory: "MemoryAgent"):
     # ── Register nodes ────────────────────────────────────────────────────────
     g.add_node("receive_claim",      receive_claim)
     g.add_node("query_memory",       _query_memory)
+    g.add_node("freshness_check",    _freshness_check)
     g.add_node("return_cached",      return_cached)
     g.add_node("live_search",        _live_search)
     g.add_node("rag_retrieval",      rag_retrieval)
@@ -72,10 +75,16 @@ def build_graph(memory: "MemoryAgent"):
     g.set_entry_point("receive_claim")
     g.add_edge("receive_claim", "query_memory")
 
-    # Router: cache hit → return_cached, else → live_search
+    # Confidence router: high-confidence cache hit → freshness_check, else → live_search
     g.add_conditional_edges("query_memory", router, {
-        "cache":       "return_cached",
+        "cache":       "freshness_check",
         "live_search": "live_search",
+    })
+
+    # Freshness router: fresh cached verdict → return_cached, stale → re-run live search
+    g.add_conditional_edges("freshness_check", freshness_router, {
+        "fresh": "return_cached",
+        "stale": "live_search",
     })
 
     # Live search path: fetch live evidence → augment with RAG → synthesize

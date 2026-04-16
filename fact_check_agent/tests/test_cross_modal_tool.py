@@ -1,8 +1,8 @@
-"""Tests for the cross-modal agent — no OpenAI API key required."""
+"""Tests for the cross-modal tool — no OpenAI API key required."""
 import json
 from unittest.mock import MagicMock, patch
 
-from fact_check_agent.src.agents.cross_modal_agent import check_cross_modal
+from fact_check_agent.src.tools.cross_modal_tool import check_cross_modal
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ def test_empty_image_caption_returns_no_flag():
 # ── LLM says no conflict ──────────────────────────────────────────────────────
 
 def test_no_conflict_llm_returns_false_flag():
-    with patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             conflict=False
         )
@@ -63,7 +63,7 @@ def test_no_conflict_llm_returns_false_flag():
 # ── LLM says conflict ─────────────────────────────────────────────────────────
 
 def test_conflict_llm_returns_true_flag():
-    with patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             conflict=True,
             explanation="Image shows protest but claim says peaceful gathering.",
@@ -76,14 +76,14 @@ def test_conflict_llm_returns_true_flag():
         )
 
     assert result["flag"] is True
-    assert "protest" in result["explanation"] or "violent" in result["explanation"] or result["explanation"] is not None
+    assert result["explanation"] is not None
 
 
 # ── LLM API failure ───────────────────────────────────────────────────────────
 
 def test_llm_failure_returns_no_flag():
     """If OpenAI call fails, the check should degrade gracefully to flag=False."""
-    with patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cls:
         mock_cls.return_value.chat.completions.create.side_effect = Exception("API error")
         result = check_cross_modal(
             claim_text="Some claim",
@@ -99,7 +99,7 @@ def test_llm_failure_returns_no_flag():
 
 def test_clip_score_is_none_when_disabled():
     """ENABLE_CLIP=False by default — clip_score should always be None."""
-    with patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             conflict=False
         )
@@ -110,5 +110,4 @@ def test_clip_score_is_none_when_disabled():
             model="gpt-4o",
         )
 
-    # ENABLE_CLIP is False — no CLIP call should have happened
     assert result["clip_score"] is None

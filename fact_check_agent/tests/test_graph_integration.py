@@ -93,8 +93,8 @@ def test_graph_live_search_path_returns_output():
     verdict = make_openai_verdict_response()
     xmodal  = make_openai_cross_modal_response()
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cm_cls, \
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
+         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
          patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
@@ -119,14 +119,14 @@ def test_graph_writes_verdict_to_memory():
     verdict = make_openai_verdict_response()
     xmodal  = make_openai_cross_modal_response()
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cm_cls, \
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
+         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
          patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls, \
          patch("fact_check_agent.src.graph.nodes.write_memory.__module__"):
         pass  # patch context handled below
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cm_cls, \
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
+         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
          patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
@@ -155,8 +155,8 @@ def test_graph_verdict_fields_populated():
     )
     xmodal  = make_openai_cross_modal_response(conflict=False)
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cm_cls, \
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
+         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
          patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
@@ -184,8 +184,8 @@ def test_graph_cross_modal_flag_propagated():
     xmodal_content = json.dumps({"conflict": True, "explanation": "Image contradicts text."})
     xmodal.choices[0].message.content = xmodal_content
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.agents.cross_modal_agent.OpenAI") as mock_cm_cls, \
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
+         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
          patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()

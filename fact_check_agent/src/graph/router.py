@@ -12,6 +12,18 @@ def router(state: FactCheckState) -> str:
     return "live_search"
 
 
+def freshness_router(state: FactCheckState) -> str:
+    """After a cache hit, decide whether to serve the cached verdict or re-verify.
+
+    Returns:
+        "fresh"  → use cached verdict; skip live search (return_cached → synthesize)
+        "stale"  → run live search before synthesizing (live_search → rag_retrieval → synthesize)
+    """
+    if state.get("revalidation_needed"):
+        return "stale"
+    return "fresh"
+
+
 def debate_check(state: FactCheckState) -> str:
     """Decide whether to trigger multi-agent debate.
 

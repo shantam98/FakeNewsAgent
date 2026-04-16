@@ -1,7 +1,7 @@
-"""Tests for the live search agent — no Tavily API key required."""
+"""Tests for the live search tool — no Tavily API key required."""
 from unittest.mock import MagicMock, patch
 
-from fact_check_agent.src.agents.live_search_agent import (
+from fact_check_agent.src.tools.live_search_tool import (
     _count_distinct_domains,
     format_search_context,
     search_live,
@@ -61,7 +61,6 @@ def test_format_search_context_truncates_long_content():
     long_content = "x" * 500
     results = [{"url": "https://example.com", "title": "T", "content": long_content}]
     context, _ = format_search_context(results)
-    # Content is capped at 300 chars in the implementation
     assert len(context) < 500
 
 
@@ -81,7 +80,7 @@ def make_tavily_result(urls):
 
 
 def test_search_live_returns_results():
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_cls:
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_cls:
         mock_cls.return_value.search.return_value = make_tavily_result([
             "https://reuters.com/1",
             "https://bbc.co.uk/1",
@@ -98,17 +97,16 @@ def test_search_live_retries_when_too_few_domains():
         "https://reuters.com/1", "https://bbc.co.uk/1", "https://apnews.com/1"
     ])
 
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_cls:
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_cls:
         mock_cls.return_value.search.side_effect = [few_domains, many_domains]
         results = search_live("test claim", api_key="fake-key")
 
-    # Should have called search twice (initial + retry)
     assert mock_cls.return_value.search.call_count == 2
     assert len(results) == 3
 
 
 def test_search_live_handles_tavily_error():
-    with patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_cls:
+    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_cls:
         mock_cls.return_value.search.side_effect = Exception("API error")
         results = search_live("test claim", api_key="fake-key")
 

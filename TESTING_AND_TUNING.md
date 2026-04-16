@@ -4,28 +4,43 @@
 
 ---
 
+## Naming conventions
+
+| Term | Meaning in this codebase |
+|---|---|
+| **Tool** | A single function — one API call or one LLM call, no loops, no planning. Lives in `src/tools/`. |
+| **Agent** | A multi-step, stateful orchestrator that routes between tools or accumulates knowledge across calls. Lives in `src/agents/` or `memory_agent/src/memory/`. |
+| **Node** | One step inside the LangGraph pipeline. Calls one or more tools/agents and updates state. Lives in `src/graph/nodes.py`. |
+
+---
+
 ## 0. Setup
 
 ```bash
-cd fact_check_agent
-pip install -r requirements.txt
+cd fakenews
+pip install -r fact_check_agent/requirements.txt
 cp .env.example .env          # fill in API keys
-export PYTHONPATH=$(pwd)/..   # makes both fact_check_agent and memory_agent importable
+```
+
+Run all tests (from the repo root):
+```bash
+PYTHONPATH="" .venv/bin/python -m pytest fact_check_agent/tests/ -v
 ```
 
 ---
 
-## 1. Unit Testing Individual Components
+## 1. Unit Testing Individual Tools
 
-Each agent module is a pure Python function — testable without a live LLM or database.
+Each tool in `src/tools/` is a pure function — testable without a live LLM or database.
 
-### 1.1 RAG Agent
+### 1.1 RAG Tool (`src/tools/rag_tool.py`)
 
-**What to test:** Correct parsing of ChromaDB result dicts, graceful handling of empty results, context block formatting.
+**What it does:** Queries ChromaDB for semantically similar past claims, fetches their verdicts, and formats them as a prompt context block. No LLM call.
+
+**Test file:** `tests/test_rag_tool.py` ✅
 
 ```python
-# tests/test_rag_agent.py
-from fact_check_agent.src.agents.rag_agent import format_rag_context
+from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
 
 def test_format_rag_context_with_verdict():
     claims = [{
@@ -35,37 +50,20 @@ def test_format_rag_context_with_verdict():
     result = format_rag_context(claims)
     assert "refuted" in result
     assert "95%" in result
-
-def test_format_rag_context_empty():
-    result = format_rag_context([])
-    assert "No similar claims" in result
-
-# Mock MemoryAgent for retrieve_similar_claims
-class MockMemory:
-    def search_similar_claims(self, text, top_k):
-        return {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-    def get_verdict_by_claim(self, claim_id):
-        return {"metadatas": []}
-
-def test_retrieve_empty_memory():
-    from fact_check_agent.src.agents.rag_agent import retrieve_similar_claims
-    results = retrieve_similar_claims("any claim", MockMemory())
-    assert results == []
 ```
 
-**Toggle to test:** Change `top_k` in `retrieve_similar_claims()` to see how many results are returned.
+**Toggle to tune:** Change `top_k` in `retrieve_similar_claims()` to control how many prior claims are retrieved.
 
 ---
 
-### 1.2 Live Search Agent
+### 1.2 Live Search Tool (`src/tools/live_search_tool.py`)
 
-**What to test:** Domain deduplication logic, fallback retry query, formatting of Tavily results.
+**What it does:** Calls Tavily API for current web evidence. Retries with a broader query if fewer than `_MIN_DISTINCT_DOMAINS` distinct sources are returned.
+
+**Test file:** `tests/test_live_search_tool.py` ✅
 
 ```python
-# tests/test_live_search_agent.py
-from fact_check_agent.src.agents.live_search_agent import (
-    _count_distinct_domains, format_search_context
-)
+from fact_check_agent.src.tools.live_search_tool import _count_distinct_domains, format_search_context
 
 def test_count_distinct_domains():
     results = [
@@ -74,245 +72,162 @@ def test_count_distinct_domains():
         {"url": "https://reuters.com/article/1"},
     ]
     assert _count_distinct_domains(results) == 2
-
-def test_format_search_context_empty():
-    context, links = format_search_context([])
-    assert "No results" in context
-    assert links == []
-
-def test_format_search_context():
-    results = [{"url": "https://example.com", "title": "Test", "content": "Some content"}]
-    context, links = format_search_context(results)
-    assert "example.com" in context
-    assert links == ["https://example.com"]
 ```
 
-**Toggle to tune:** Change `_MIN_DISTINCT_DOMAINS` in `live_search_agent.py` (default 3) to require more source diversity.
+**Toggle to tune:** Change `_MIN_DISTINCT_DOMAINS` in `live_search_tool.py` (default 3) to require more or less source diversity.
 
 ---
 
-### 1.3 Cross-Modal Agent
+### 1.3 Cross-Modal Tool (`src/tools/cross_modal_tool.py`)
 
-**What to test:** Returns `flag=False` when `image_caption=None`, handles LLM JSON parse errors gracefully.
+**What it does:** Makes a single LLM call to check for logical conflicts between the claim text and the image caption. Optionally adds a CLIP similarity score (gated by `ENABLE_CLIP`).
+
+**Test file:** `tests/test_cross_modal_tool.py` ✅
 
 ```python
-# tests/test_cross_modal_agent.py
 from unittest.mock import patch, MagicMock
-from fact_check_agent.src.agents.cross_modal_agent import check_cross_modal
+from fact_check_agent.src.tools.cross_modal_tool import check_cross_modal
 
 def test_no_image_caption():
     result = check_cross_modal("any claim", None, "fake-key", "gpt-4o")
     assert result == {"flag": False, "explanation": None, "clip_score": None}
-
-def test_llm_detects_conflict():
-    mock_response = MagicMock()
-    mock_response.choices[0].message.content = '{"conflict": true, "explanation": "Image shows peace rally, claim says riot."}'
-    with patch("openai.OpenAI") as mock_openai:
-        mock_openai.return_value.chat.completions.create.return_value = mock_response
-        result = check_cross_modal("Violent riot erupted", "People holding peace signs", "k", "gpt-4o")
-    assert result["flag"] is True
-    assert "peace" in result["explanation"]
 ```
 
-**Toggle to enable CLIP:** Set `ENABLE_CLIP = True` in `cross_modal_agent.py`. Requires `torch` and `transformers`.
+**Toggle to enable CLIP:** Set `ENABLE_CLIP = True` in `cross_modal_tool.py`. Requires `torch` and `transformers`.
 
 ---
 
-### 1.4 Router
+### 1.4 Freshness Tool (`src/tools/freshness_tool.py`)
 
-**What to test:** Confidence threshold boundary, handles missing/None memory_results.
+**What it does:** Makes a single LLM call to classify whether a cached verdict needs live re-verification, based on claim text, prior verdict, and days since last verification.
+
+**Test file:** `tests/test_freshness_tool.py` ✅
 
 ```python
-# tests/test_router.py
-from fact_check_agent.src.graph.router import router, CACHE_CONFIDENCE_THRESHOLD
-from fact_check_agent.src.models.schemas import MemoryQueryResponse, SimilarClaim
+from unittest.mock import patch
+from fact_check_agent.src.tools.freshness_tool import check_freshness
+from datetime import datetime, timezone, timedelta
 
-def make_state(max_confidence):
-    return {
-        "memory_results": MemoryQueryResponse(results=[], max_confidence=max_confidence),
-    }
-
-def test_router_cache_hit():
-    assert router(make_state(0.85)) == "cache"
-
-def test_router_live_search():
-    assert router(make_state(0.75)) == "live_search"
-
-def test_router_exact_threshold():
-    # At exactly 0.80 → cache
-    assert router(make_state(CACHE_CONFIDENCE_THRESHOLD)) == "cache"
-
-def test_router_no_memory():
-    assert router({"memory_results": None}) == "live_search"
+def test_fresh_historical_claim():
+    # Historical facts should not trigger revalidation even if old
+    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+        mock_cls.return_value.chat.completions.create.return_value = ...
+        result = check_freshness(
+            claim_text="The French Revolution began in 1789.",
+            verdict_label="supported",
+            verdict_confidence=0.99,
+            last_verified_at=datetime.now(timezone.utc) - timedelta(days=365),
+            api_key="fake-key",
+            model="gpt-4o",
+        )
+    assert result["revalidate"] is False
 ```
 
-**Toggle to tune:** Change `CACHE_CONFIDENCE_THRESHOLD` in `router.py`. Lower = more cache hits, less live search cost.
+**Toggle to tune:** Edit `FRESHNESS_CHECK_PROMPT` in `src/prompts.py` — adjust day thresholds per category or add few-shot examples.
 
 ---
 
-### 1.5 Verdict Synthesis (LLM prompt)
+### 1.5 Verdict Synthesis (LLM prompt in `src/graph/nodes.py`)
 
-**What to test:** Prompt renders correctly, JSON output parses into `FactCheckOutput`.
+**What it does:** Calls gpt-4o with the evidence block and returns a structured verdict JSON. This is a node, not a standalone tool — tested via `test_data_contracts.py`.
+
+**Test file:** `tests/test_data_contracts.py` ✅ (covers prompt rendering, JSON parsing, missing-key fallback, invalid JSON fallback)
 
 ```python
-# tests/test_prompts.py
 from fact_check_agent.src.prompts import VERDICT_SYNTHESIS_PROMPT
 
 def test_verdict_prompt_renders():
     rendered = VERDICT_SYNTHESIS_PROMPT.format(
         claim_text="The moon is made of cheese",
         evidence_block="[LIVE SEARCH] NASA confirms moon is rock.",
-        source_credibility_note="Source: nasa.gov (credibility: 0.98)",
+        source_credibility_note="Source: nasa.gov",
     )
     assert "moon is made of cheese" in rendered
-    assert "evidence_links" in rendered   # JSON key present in template
-```
-
-**LLM output validation** — after calling the real API:
-```python
-import json
-
-def validate_verdict_json(raw: str):
-    result = json.loads(raw)
-    assert result["verdict"] in ("supported", "refuted", "misleading")
-    assert 0 <= result["confidence_score"] <= 100
-    assert 0.0 <= result["bias_score"] <= 1.0
-    assert isinstance(result["reasoning"], str)
-    assert isinstance(result["evidence_links"], list)
+    assert "evidence_links" in rendered
 ```
 
 ---
 
-## 2. Integration Testing — LangGraph Graph
+## 2. Reflection Agent (`src/agents/reflection_agent.py`)
 
-Test the full graph end-to-end with a mock MemoryAgent, no live API calls required.
+**What it does:** Maintains per-source, topic-conditioned credibility signals in the `source_credibility` ChromaDB collection. Runs in two directions:
+
+- **READ** (`query_source_credibility`): before verdict synthesis, fetches k nearest (source, topic) observations and returns `{credibility_mean, bias_mean, bias_std, sample_count}` via distance-weighted aggregation.
+- **WRITE** (`update_source_credibility`): after verdict synthesis, appends one new observation. Always inserts — never overwrites.
+
+**Credibility signal mapping:**
+
+| Verdict | Signal |
+|---|---|
+| `supported` (confidence c) | `c / 100` — source made a truthful claim |
+| `refuted` (confidence c) | `1 - c / 100` — source made a false claim |
+| `misleading` | `0.5` — ambiguous |
+
+**Test file:** `tests/test_reflection_agent.py` ✅
 
 ```python
-# tests/test_graph_integration.py
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from fact_check_agent.src.agents.reflection_agent import credibility_signal, source_id_from_url
 
-from fact_check_agent.src.graph.graph import build_graph
-from fact_check_agent.src.models.schemas import (
-    FactCheckInput, MemoryQueryResponse, SimilarClaim
-)
+def test_credibility_signal_supported():
+    assert credibility_signal("supported", 80) == 0.80
 
-
-def make_mock_memory(max_confidence=0.0):
-    """Mock MemoryAgent that returns controllable responses."""
-    memory = MagicMock()
-    memory.search_similar_claims.return_value = {
-        "ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]
-    }
-    memory.get_entity_context.return_value = []
-    memory.get_source_credibility.return_value = 0.7
-    memory.get_caption_by_article.return_value = {"documents": []}
-    memory.get_verdict_by_claim.return_value = {"metadatas": []}
-    memory.add_verdict.return_value = None
-    return memory
-
-
-def make_input(claim_text="Test claim", image_caption=None):
-    return FactCheckInput(
-        claim_id="clm_test_001",
-        claim_text=claim_text,
-        entities=[],
-        source_url="https://example.com",
-        article_id="art_test_001",
-        image_caption=image_caption,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-
-def test_graph_live_search_path():
-    """Full graph run on the live-search path with mocked LLM + memory."""
-    mock_memory = make_mock_memory(max_confidence=0.0)   # forces live_search
-
-    mock_llm_verdict = '{"verdict": "refuted", "confidence_score": 78, "bias_score": 0.3, "reasoning": "Test reasoning.", "evidence_links": ["https://fact.com"]}'
-    mock_llm_cross   = '{"conflict": false, "explanation": null}'
-
-    with patch("openai.OpenAI") as mock_openai, \
-         patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily:
-
-        mock_tavily.return_value.search.return_value = {"results": [
-            {"url": "https://reuters.com/1", "title": "Test", "content": "Some evidence"},
-            {"url": "https://bbc.co.uk/1",  "title": "Test", "content": "More evidence"},
-            {"url": "https://apnews.com/1", "title": "Test", "content": "Extra evidence"},
-        ]}
-        mock_openai.return_value.chat.completions.create.side_effect = [
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_verdict))]),
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_cross))]),
-        ]
-
-        graph = build_graph(mock_memory)
-        state = graph.invoke({"input": make_input()})
-
-    output = state["output"]
-    assert output is not None
-    assert output.verdict == "refuted"
-    assert output.confidence_score == 78
-    assert output.cross_modal_flag is False
-    mock_memory.add_verdict.assert_called_once()
-
-
-def test_graph_cache_path():
-    """Graph should return_cached when memory confidence > 0.80."""
-    mock_memory = make_mock_memory()
-    # Simulate a high-confidence memory hit
-    mock_memory.search_similar_claims.return_value = {
-        "ids":       [["clm_existing"]],
-        "documents": [["Prior claim about same topic"]],
-        "distances": [[0.05]],
-        "metadatas": [[{"article_id": "art_1", "source_id": "src_1", "status": "verified"}]],
-    }
-    mock_memory.get_verdict_by_claim.return_value = {
-        "metadatas": [{"label": "supported", "confidence": 0.92}]
-    }
-
-    mock_llm_verdict = '{"verdict": "supported", "confidence_score": 92, "bias_score": 0.1, "reasoning": "Cached.", "evidence_links": []}'
-    mock_llm_cross   = '{"conflict": false, "explanation": null}'
-
-    with patch("openai.OpenAI") as mock_openai:
-        mock_openai.return_value.chat.completions.create.side_effect = [
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_verdict))]),
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_cross))]),
-        ]
-        graph = build_graph(mock_memory)
-        state = graph.invoke({"input": make_input()})
-
-    assert state["route"] == "cache"
-    assert state["output"].verdict == "supported"
-
-
-def test_graph_cross_modal_flagged():
-    """Cross-modal flag should propagate to FactCheckOutput."""
-    mock_memory = make_mock_memory()
-    mock_llm_verdict = '{"verdict": "misleading", "confidence_score": 60, "bias_score": 0.6, "reasoning": "Out of context.", "evidence_links": []}'
-    mock_llm_cross   = '{"conflict": true, "explanation": "Image shows a hospital, claim mentions a protest."}'
-
-    with patch("openai.OpenAI") as mock_openai, \
-         patch("fact_check_agent.src.agents.live_search_agent.TavilyClient") as mock_tavily:
-
-        mock_tavily.return_value.search.return_value = {"results": [
-            {"url": f"https://source{i}.com", "title": "T", "content": "C"} for i in range(3)
-        ]}
-        mock_openai.return_value.chat.completions.create.side_effect = [
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_verdict))]),
-            MagicMock(choices=[MagicMock(message=MagicMock(content=mock_llm_cross))]),
-        ]
-
-        graph = build_graph(mock_memory)
-        state = graph.invoke({"input": make_input(image_caption="People in hospital beds")})
-
-    assert state["output"].cross_modal_flag is True
-    assert "hospital" in state["output"].cross_modal_explanation
+def test_credibility_signal_refuted():
+    assert credibility_signal("refuted", 80) == 0.20
 ```
+
+**Toggle to tune (see also `TODO.md`):**
+- Add topic normalisation — strip entities/dates before embedding
+- Add recency weighting — `half_life_days` multiplier on distance weights
 
 ---
 
-## 3. Benchmark Evaluation
+## 3. Routing Logic
 
-### 3.1 LIAR — Full Test Split
+### 3.1 Confidence Router (`src/graph/router.py`)
+
+**What it does:** Routes to `freshness_check` if `max_confidence >= 0.80`, else to `live_search`.
+
+**Test file:** `tests/test_router.py` ✅ (covers threshold boundary, None memory, zero confidence)
+
+**Toggle to tune:** Change `CACHE_CONFIDENCE_THRESHOLD` in `router.py`.
+
+| Value | Effect |
+|---|---|
+| `0.90` | Fewer cache hits, more live search, higher accuracy |
+| `0.80` | Default — balanced |
+| `0.65` | More cache hits, lower cost, risk of stale verdicts |
+
+### 3.2 Freshness Router (`src/graph/router.py`)
+
+**What it does:** After a cache hit, routes to `return_cached` (fresh) or `live_search` (stale) based on `revalidation_needed` from the freshness tool.
+
+**Test file:** `tests/test_router.py` ❌ `freshness_router` not yet tested
+
+---
+
+## 4. Integration Testing — LangGraph Agent
+
+Test the full agent graph end-to-end with mocked tools and memory — no live API calls required.
+
+**Test file:** `tests/test_graph_integration.py` ✅
+
+Scenarios covered:
+- ✅ Live-search path returns a valid `FactCheckOutput`
+- ✅ Verdict fields from LLM response land on output correctly
+- ✅ Cross-modal flag propagates to output
+- ✅ `receive_claim` node resets all mutable state fields
+- ❌ Cache path (`route == "cache"`, `return_cached` node exercised)
+- ❌ Freshness tool returns `revalidate=True` → graph takes stale path (live search runs)
+- ❌ Freshness tool returns `revalidate=False` → graph takes fresh path (live search skipped)
+- ❌ `write_memory` called with correct `Verdict` fields
+- ❌ `source_credibility` populated in state after `query_memory`
+- ❌ Reflection agent `update_source_credibility` called after verdict is written
+
+---
+
+## 5. Benchmark Evaluation
+
+### 5.1 LIAR — Full Test Split
 
 ```bash
 # Direct eval (no memory seeding)
@@ -331,18 +246,11 @@ python -m fact_check_agent.benchmark.run_eval \
     --output results/liar_test_seeded.json
 ```
 
-Expected baseline: ~35–45% binary accuracy. SOTA LLM approaches reach ~50%.
+Expected baseline: ~35–45% binary accuracy.
 
-### 3.2 FakeNewsNet
+### 5.2 FakeNewsNet
 
 ```bash
-# Generate captions first (one-time, cached to pickle)
-python -m fact_check_agent.benchmark.generate_captions \
-    --dataset-root /path/to/fakenewsnet \
-    --source politifact \
-    --cache politifact_captions.pkl
-
-# Run eval
 python -m fact_check_agent.benchmark.run_eval \
     --dataset fakenewsnet \
     --fnn-root /path/to/fakenewsnet \
@@ -351,48 +259,39 @@ python -m fact_check_agent.benchmark.run_eval \
     --output results/fnn_politifact.json
 ```
 
-### 3.3 Reading Results
+### 5.3 Reading Results
 
 ```python
 import json
-from sklearn.metrics import confusion_matrix
-
 with open("results/liar_test.json") as f:
     results = json.load(f)
 
 print(f"Macro-F1: {results['macro_f1']:.4f}")
 
-# Identify hardest failures
 failures = [r for r in results["rows"] if not r["correct"]]
 high_conf_wrong = [r for r in failures if r["confidence_score"] > 70]
-print(f"\nHigh-confidence wrong predictions: {len(high_conf_wrong)}")
 for r in high_conf_wrong[:5]:
     print(f"  [{r['ground_truth_label']}→{r['predicted_verdict']}] {r['claim_text']}")
 ```
 
 ---
 
-## 4. Prompt Tuning
+## 6. Prompt Tuning
 
-All prompts are in [src/prompts.py](fact_check_agent/src/prompts.py). Tuning workflow:
+All prompts are in `src/prompts.py`. Each has a version comment — bump it and re-run benchmarks after any change.
 
-### 4.1 Identify failing classes
+### 6.1 Identify failing classes
 
 ```python
 from sklearn.metrics import confusion_matrix
-import numpy as np
-
 cm = confusion_matrix(results["y_true"], results["y_pred"])
-print("Confusion matrix (rows=true, cols=pred):")
 print(cm)
 ```
 
-Common failure: `misleading` predicted as `supported` (model is too generous).
+### 6.2 Tune `VERDICT_SYNTHESIS_PROMPT`
 
-### 4.2 Add few-shot examples to `VERDICT_SYNTHESIS_PROMPT`
-
+Add few-shot examples after the evidence block:
 ```python
-# Add to the prompt template after the evidence block:
 FEW_SHOT_BLOCK = """
 EXAMPLES OF HARD CASES:
 - Claim: "GDP grew 3% last quarter" + Evidence: "GDP grew 1.8%" → misleading (exaggerated number)
@@ -400,74 +299,51 @@ EXAMPLES OF HARD CASES:
 """
 ```
 
-Append `FEW_SHOT_BLOCK` to `VERDICT_SYNTHESIS_PROMPT` and re-run eval. Track Macro-F1 delta.
+The prompt now includes a `source_credibility_note` block populated by the Reflection Agent.
+The LLM is instructed to lower its confidence score when source credibility is low and evidence is thin.
 
-### 4.3 Adjust confidence threshold for cache hits
+### 6.3 Tune `FRESHNESS_CHECK_PROMPT`
 
-| `CACHE_CONFIDENCE_THRESHOLD` | Effect |
-|---|---|
-| `0.90` | Fewer cache hits, more live search, higher accuracy, more cost |
-| `0.80` | Default — balanced |
-| `0.65` | More cache hits, lower cost, may reuse stale verdicts |
-
-Change in [src/graph/router.py](fact_check_agent/src/graph/router.py).
-
-### 4.4 Adjust minimum source diversity for live search
-
-Change `_MIN_DISTINCT_DOMAINS` in [src/agents/live_search_agent.py](fact_check_agent/src/agents/live_search_agent.py).
-
-| Value | Effect |
-|---|---|
-| `1` | Accept any result — lower latency, less diverse evidence |
-| `3` | Default — 3 distinct domains required |
-| `5` | High diversity — more retries, higher cost |
-
----
-
-## 5. Enabling SOTA Enhancements
-
-All SOTA features are gated by flags or commented-out code. None affect the baseline.
-
-| Enhancement | File | How to enable |
-|---|---|---|
-| **GraphRAG** | `src/agents/rag_agent.py` | Add `get_entity_claims()` call after `get_entity_context()` in `query_memory` node |
-| **Self-RAG** | `src/graph/nodes.py` | Add `IS_RETRIEVAL_NEEDED_PROMPT` call before `live_search` node; filter chunks with `CHUNK_RELEVANCE_PROMPT` before `synthesize_verdict` |
-| **Claim Decomposition** | `src/graph/nodes.py` | Add decomposition node before `live_search`; run synthesis per sub-claim |
-| **Multi-Agent Debate** | `src/graph/router.py` | Uncomment the `debate_check` SOTA block (triggers when `35 < confidence < 65`) |
-| **CLIP Cross-Modal** | `src/agents/cross_modal_agent.py` | Set `ENABLE_CLIP = True`; requires `torch` and `transformers` |
-
-Enable one at a time and re-run benchmarks after each — measure the Macro-F1 delta before combining.
-
----
-
-## 6. LangSmith Tracing
-
-With `LANGCHAIN_TRACING_V2=true` in `.env`, every `graph.invoke()` is traced automatically.
-
-**What to inspect in LangSmith:**
-- Node execution times — identify slow nodes (usually `synthesize_verdict` and `live_search`)
-- `retrieved_chunks` state value — check evidence quality going into the LLM
-- `debate_transcript` — review debate quality when SOTA debate is enabled
-- Token counts per node — spot over-long prompts
-
-**Filtering useful runs:**
-```python
-# LangSmith Python SDK — find high-confidence wrong predictions
-from langsmith import Client
-client = Client()
-
-runs = client.list_runs(project_name="fakenews-factcheck")
-for run in runs:
-    output = run.outputs.get("output", {})
-    if output.get("confidence_score", 0) > 70:
-        print(run.id, output.get("verdict"), output.get("claim_id"))
+Adjust per-category day thresholds or add new categories:
+```
+- Political claims, election results: re-verify if > 7 days old    ← tune this
+- Ongoing events: re-verify if > 3 days old                        ← tune this
+- Scientific consensus: re-verify if > 180 days old                ← tune this
 ```
 
 ---
 
-## 7. Quick Sanity Check (No API Keys Needed)
+## 7. Enabling SOTA Enhancements
 
-Verify the graph compiles and all imports resolve before setting up full credentials:
+All SOTA features are gated by flags or commented-out code. See also `TODO.md` for planned improvements.
+
+| Enhancement | File | How to enable |
+|---|---|---|
+| **GraphRAG** | `src/tools/rag_tool.py` | Add `get_entity_claims()` call after `get_entity_context()` in `query_memory` node |
+| **Self-RAG** | `src/graph/nodes.py` | Add `IS_RETRIEVAL_NEEDED_PROMPT` call before `live_search` node; filter chunks with `CHUNK_RELEVANCE_PROMPT` |
+| **Claim Decomposition** | `src/graph/nodes.py` | Add decomposition node before `live_search`; run synthesis per sub-claim |
+| **Multi-Agent Debate** | `src/graph/router.py` | Uncomment the `debate_check` SOTA block (triggers when `35 < confidence < 65`) |
+| **CLIP Cross-Modal** | `src/tools/cross_modal_tool.py` | Set `ENABLE_CLIP = True`; requires `torch` and `transformers` |
+| **Freshness classifier upgrade** | `src/tools/freshness_tool.py` | Replace single LLM call with a ReAct agent that can check news APIs and entity activity |
+| **Topic normalisation** | `src/agents/reflection_agent.py` | Strip entities/dates before embedding claim as topic vector (see `TODO.md`) |
+| **Recency weighting** | `src/agents/reflection_agent.py` | Add `half_life_days` multiplier to distance weights using stored `created_at` (see `TODO.md`) |
+
+---
+
+## 8. LangSmith Tracing
+
+With `LANGCHAIN_TRACING_V2=true` in `.env`, every `graph.invoke()` is traced automatically.
+
+**What to inspect:**
+- Node execution times — `synthesize_verdict` and `live_search` are typically slowest
+- `retrieved_chunks` state — check evidence quality going into the LLM
+- `revalidation_needed` state — verify the freshness tool is routing correctly
+- `source_credibility` state — verify the reflection agent is populating credibility signals
+- Token counts per node — spot over-long prompts
+
+---
+
+## 9. Quick Sanity Check (No API Keys Needed)
 
 ```python
 # sanity_check.py
@@ -480,8 +356,6 @@ print("Graph nodes:", list(graph.nodes))
 print("Graph compiled successfully.")
 ```
 
-Run with:
 ```bash
-cd fakenews
-PYTHONPATH=. python sanity_check.py
+PYTHONPATH="" .venv/bin/python sanity_check.py
 ```

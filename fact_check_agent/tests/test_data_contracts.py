@@ -11,8 +11,8 @@ import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from fact_check_agent.src.agents.live_search_agent import format_search_context
-from fact_check_agent.src.agents.rag_agent import format_rag_context, retrieve_similar_claims
+from fact_check_agent.src.tools.live_search_tool import format_search_context
+from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
 from fact_check_agent.src.graph.router import CACHE_CONFIDENCE_THRESHOLD, router
 from fact_check_agent.src.models.schemas import (
     EntityRef, FactCheckInput, FactCheckOutput, MemoryQueryResponse, SimilarClaim,

@@ -18,14 +18,20 @@ EVIDENCE:
 SOURCE CREDIBILITY CONTEXT:
 {source_credibility_note}
 
+The source credibility score reflects how often this source's past claims (on similar topics)
+have been verified as true. A low score does not make the current claim false — weigh it
+alongside the evidence. High bias std means the source is inconsistent across topics.
+
 Based on the evidence above, answer the following:
 1. Is the claim SUPPORTED, REFUTED, or MISLEADING?
    - SUPPORTED: evidence clearly backs the claim
    - REFUTED: evidence clearly contradicts the claim
    - MISLEADING: claim is partially true, taken out of context, or exaggerated
 2. Confidence score (0–100): how certain are you given the available evidence?
+   Lower this score if source credibility is low and evidence is thin.
 3. Bias score (0.0–1.0): how much political, ideological, or emotional bias does this claim carry?
-4. Reasoning: summarise your chain of thought in 2–3 sentences.
+4. Reasoning: summarise your chain of thought in 2–3 sentences. Mention source credibility
+   only if it materially influenced your verdict.
 
 Return a JSON object with exactly these keys:
 {{
@@ -58,6 +64,32 @@ Return JSON:
 {{
   "conflict": true | false,
   "explanation": "<one sentence describing the conflict, or null if no conflict>"
+}}
+"""
+
+# ── v1.0 freshness classifier ────────────────────────────────────────────────
+
+FRESHNESS_CHECK_PROMPT = """\
+You are deciding whether a cached fact-check verdict needs live re-verification.
+
+CLAIM: {claim_text}
+
+PRIOR VERDICT: {verdict_label} ({verdict_confidence:.0%} confidence)
+LAST VERIFIED: {time_since_verified_days} days ago
+
+Guidelines for re-verification:
+- Political claims, election results, government policy: re-verify if > 7 days old
+- Ongoing events (court cases, conflicts, legislation in progress): re-verify if > 3 days old
+- Economic data (prices, unemployment, GDP): re-verify if > 14 days old
+- Scientific consensus, medical guidelines: re-verify if > 180 days old
+- Historical facts, geography, physical constants: almost never need re-verification
+- Satire or clearly fabricated claims: rarely need re-verification
+
+Return a JSON object:
+{{
+  "revalidate": true | false,
+  "reason": "<one sentence explaining the decision>",
+  "claim_category": "<political|ongoing_event|economic|scientific|historical|other>"
 }}
 """
 
