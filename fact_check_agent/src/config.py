@@ -19,10 +19,13 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = ""
 
-    # ChromaDB Cloud (passed through to MemoryAgent at runtime)
+    # ChromaDB — cloud (leave blank to use local Docker instance)
     chroma_api_key: str = ""
     chroma_tenant: str = ""
     chroma_database: str = ""
+    # ChromaDB — local Docker (used when chroma_api_key is blank)
+    chroma_host: str = ""
+    chroma_port: int = 8000
 
     # OpenAI
     openai_api_key: str = ""

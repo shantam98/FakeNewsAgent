@@ -45,6 +45,9 @@ htmlcov/
 # ── Datasets (large files — download locally, never commit) ──────────────────
 datasets/
 
+# ── Local DB data (Docker bind mounts) ───────────────────────────────────────
+data/
+
 # ── Benchmark artefacts ───────────────────────────────────────────────────────
 caption_cache.pkl
 results/

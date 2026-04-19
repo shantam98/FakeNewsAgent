@@ -1,0 +1,54 @@
+services:
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: fakenews-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # Neo4j Browser (web UI)
+      - "7687:7687"   # Bolt protocol (driver connection)
+    environment:
+      NEO4J_AUTH: neo4j/fakenews123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes:
+      - ./data/neo4j/data:/data
+      - ./data/neo4j/logs:/logs
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: fakenews-chroma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # ChromaDB HTTP API
+    volumes:
+      - ./data/chroma:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+
+  langfuse-db:
+    image: postgres:15
+    container_name: fakenews-langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse123
+      POSTGRES_DB: langfuse
+    volumes:
+      - ./data/langfuse-db:/var/lib/postgresql/data
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: fakenews-langfuse
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # Langfuse UI
+    depends_on:
+      - langfuse-db
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse123@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: fakenews-langfuse-secret
+      SALT: fakenews-langfuse-salt
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
