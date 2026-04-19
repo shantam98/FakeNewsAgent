@@ -30,7 +30,7 @@ def recent(days: int = 1) -> datetime:
 
 def test_historical_claim_fresh():
     """Historical facts should not need revalidation even if verified a year ago."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=False, reason="Historical fact — no revalidation needed.", category="historical"
         )
@@ -50,7 +50,7 @@ def test_historical_claim_fresh():
 
 def test_scientific_claim_verified_recently():
     """Scientific consensus verified 30 days ago should be fresh (threshold = 180 days)."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=False, category="scientific"
         )
@@ -70,7 +70,7 @@ def test_scientific_claim_verified_recently():
 
 def test_political_claim_stale():
     """Political claims verified 10 days ago should need revalidation (threshold = 7 days)."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=True, reason="Political claim is 10 days old.", category="political"
         )
@@ -89,7 +89,7 @@ def test_political_claim_stale():
 
 def test_ongoing_event_stale():
     """Ongoing events verified 5 days ago should need revalidation (threshold = 3 days)."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=True, category="ongoing_event"
         )
@@ -109,7 +109,7 @@ def test_ongoing_event_stale():
 
 def test_returns_all_keys():
     """Result must always contain revalidate, reason, and claim_category."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=False, reason="Fresh.", category="economic"
         )
@@ -130,7 +130,7 @@ def test_returns_all_keys():
 
 def test_revalidate_is_bool_not_string():
     """revalidate must be a Python bool — not a JSON string "true"."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=True
         )
@@ -150,7 +150,7 @@ def test_naive_datetime_handled():
     naive_ts = datetime.utcnow() - timedelta(days=2)
     assert naive_ts.tzinfo is None  # confirm it's naive
 
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_openai_response(
             revalidate=False
         )
@@ -168,7 +168,7 @@ def test_naive_datetime_handled():
 
 def test_api_failure_defaults_to_revalidate():
     """If OpenAI call fails, tool must default to revalidate=True (safe fallback)."""
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.side_effect = Exception("timeout")
         result = check_freshness(
             claim_text="Any claim.", verdict_label="supported",
@@ -187,7 +187,7 @@ def test_invalid_json_response_defaults_to_revalidate():
     resp = MagicMock()
     resp.choices = [choice]
 
-    with patch("fact_check_agent.src.tools.freshness_tool.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = resp
         result = check_freshness(
             claim_text="Any claim.", verdict_label="supported",

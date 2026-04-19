@@ -41,6 +41,7 @@ class FactCheckInput(BaseModel):
     article_id: str                   # used to correlate with memory store
     image_caption: Optional[str] = None  # pre-fetched VLM caption; None if no image
     timestamp: datetime
+    prefetched_chunks: list[str] = Field(default_factory=list)  # pre-fetched evidence; skips live_search when non-empty
 
 
 # ── Output contract: Fact-Check Agent → Frontend / Memory ────────────────────

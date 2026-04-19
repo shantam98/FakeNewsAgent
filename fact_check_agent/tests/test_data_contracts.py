@@ -254,7 +254,7 @@ def test_synthesize_verdict_parses_llm_fields_exactly():
         "memory_results": MemoryQueryResponse(results=[], max_confidence=0.0),
     }
 
-    with patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_llm_response(llm_payload)
         updates = synthesize_verdict(state, settings)
 
@@ -278,7 +278,7 @@ def test_synthesize_verdict_fallback_on_missing_keys():
         "memory_results": MemoryQueryResponse(results=[], max_confidence=0.0),
     }
 
-    with patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = make_llm_response(
             {"verdict": "supported"}   # missing confidence_score, bias_score, etc.
         )
@@ -308,7 +308,7 @@ def test_synthesize_verdict_fallback_on_invalid_json():
     resp = MagicMock()
     resp.choices = [choice]
 
-    with patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_cls:
+    with patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_cls:
         mock_cls.return_value.chat.completions.create.return_value = resp
         updates = synthesize_verdict(state, settings)
 

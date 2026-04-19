@@ -15,8 +15,7 @@ import json
 import logging
 from typing import Optional
 
-from openai import OpenAI
-
+import fact_check_agent.src.llm_factory as _llm_factory
 from fact_check_agent.src.prompts import CROSS_MODAL_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -64,7 +63,7 @@ def check_cross_modal(
 
 
 def _llm_check(claim_text: str, image_caption: str, api_key: str, model: str) -> dict:
-    client = OpenAI(api_key=api_key)
+    client = _llm_factory.make_llm_client()
     prompt = CROSS_MODAL_PROMPT.format(
         claim_text=claim_text,
         image_caption=image_caption,

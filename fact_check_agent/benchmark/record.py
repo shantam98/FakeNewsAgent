@@ -1,4 +1,4 @@
-"""BenchmarkRecord — unified Pydantic model for FakeNewsNet and LIAR records.
+"""BenchmarkRecord — unified Pydantic model for FakeNewsNet, LIAR, and Factify2 records.
 
 Provides two typed adapters:
   .to_preprocessing_output() → PreprocessingOutput  (seed MemoryAgent)
@@ -8,6 +8,7 @@ Loaders:
   load_fakenewsnet_article()  — single article from news_content.json
   load_fakenewsnet_dataset()  — all articles in a source/label directory tree
   load_liar_dataset()         — all rows in a LIAR TSV split file
+  load_factify2_dataset()     — tab-separated Factify2 CSV (train/val/test)
 """
 import hashlib
 import json
@@ -82,10 +83,14 @@ class BenchmarkRecord(BaseModel):
     # Ground truth
     ground_truth_label:  str
     ground_truth_binary: int   # 0 = real/true, 1 = fake/false
+    ground_truth_verdict: Optional[str] = None  # "supported" | "misleading" | "refuted" (Factify2 only)
 
     # Provenance
-    dataset: str   # "fakenewsnet_politifact" | "fakenewsnet_gossipcop" | "liar"
+    dataset: str   # "fakenewsnet_politifact" | "fakenewsnet_gossipcop" | "liar" | "factify2"
     split:   str   # "train" | "valid" | "test"
+
+    # Pre-fetched evidence (Factify2 Option A — bypasses live search)
+    prefetched_document: Optional[str] = None
 
     # LIAR-specific (None for FakeNewsNet)
     speaker:             Optional[str] = None
@@ -166,14 +171,19 @@ class BenchmarkRecord(BaseModel):
         Entities are empty — the query_memory node will populate entity context
         at runtime via MemoryAgent.get_entity_context() if records were seeded.
         """
+        prefetched: list[str] = []
+        if self.prefetched_document:
+            prefetched = [f"[REFERENCE DOCUMENT]\n{self.prefetched_document[:3000]}"]
+
         return FactCheckInput(
-            claim_id      = f"clm_{self.record_id}",
-            claim_text    = self.claim_text,
-            entities      = [],
-            source_url    = self.source_url,
-            article_id    = f"art_{self.record_id}",
-            image_caption = self.image_caption,
-            timestamp     = self.published_at or datetime.now(timezone.utc),
+            claim_id          = f"clm_{self.record_id}",
+            claim_text        = self.claim_text,
+            entities          = [],
+            source_url        = self.source_url,
+            article_id        = f"art_{self.record_id}",
+            image_caption     = self.image_caption,
+            timestamp         = self.published_at or datetime.now(timezone.utc),
+            prefetched_chunks = prefetched,
         )
 
 
@@ -298,4 +308,66 @@ def load_liar_dataset(path: str, split: str) -> list[BenchmarkRecord]:
         ))
 
     logger.info("Loaded %d LIAR records from %s (%s split)", len(records), path, split)
+    return records
+
+
+# ── Factify2 loaders ──────────────────────────────────────────────────────────
+
+_FACTIFY2_VERDICT_MAP: dict[str, str] = {
+    "Support_Multimodal":      "supported",
+    "Support_Text":            "supported",
+    "Insufficient_Multimodal": "misleading",
+    "Insufficient_Text":       "misleading",
+    "Refute":                  "refuted",
+}
+
+
+def load_factify2_dataset(path: str, split: str) -> list[BenchmarkRecord]:
+    """Load a Factify2 tab-separated CSV → list[BenchmarkRecord].
+
+    Ground-truth is the 5-way Category column, mapped to 3-way pipeline verdicts.
+    When a reference document is present it is stored in prefetched_document so
+    to_fact_check_input() can inject it directly, bypassing the live search node
+    (Option A eval — $0 Tavily cost).
+    """
+    df = pd.read_csv(path, sep="\t", engine="python", on_bad_lines="skip")
+    records: list[BenchmarkRecord] = []
+
+    for _, row in df.iterrows():
+        category = str(row.get("Category", "")).strip()
+        if not category or category not in _FACTIFY2_VERDICT_MAP:
+            continue
+
+        verdict   = _FACTIFY2_VERDICT_MAP[category]
+        claim     = str(row.get("claim", "")).strip()
+        document  = row.get("document")
+        doc_text  = str(document).strip() if pd.notna(document) and str(document).strip() else None
+
+        claim_img = row.get("claim_image")
+        img_url   = str(claim_img).strip() if pd.notna(claim_img) and str(claim_img).strip() else ""
+
+        content_hash = hashlib.sha256(claim.encode()).hexdigest()
+        record_id    = f"factify2_{split}_{content_hash[:12]}"
+
+        records.append(BenchmarkRecord(
+            record_id              = record_id,
+            claim_text             = claim,
+            source_url             = img_url or "https://factify2.dataset/unknown",
+            source_domain          = "factify2.dataset",
+            source_name            = "Factify2",
+            image_urls             = [img_url] if img_url else [],
+            image_caption          = None,
+            article_body           = doc_text,
+            article_title          = claim[:120],
+            published_at           = None,
+            content_hash           = content_hash,
+            ground_truth_label     = category,
+            ground_truth_binary    = 0 if verdict == "supported" else 1,
+            ground_truth_verdict   = verdict,
+            dataset                = "factify2",
+            split                  = split,
+            prefetched_document    = doc_text,
+        ))
+
+    logger.info("Loaded %d Factify2 records from %s (%s split)", len(records), path, split)
     return records

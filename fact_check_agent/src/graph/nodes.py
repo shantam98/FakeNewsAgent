@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from openai import OpenAI
+import fact_check_agent.src.llm_factory as _llm_factory
 
 from fact_check_agent.src.agents.reflection_agent import (
     query_source_credibility,
@@ -42,12 +42,13 @@ def receive_claim(state: FactCheckState) -> dict:
     This node does not fetch or transform data — it just resets state fields
     so downstream nodes can safely read them without KeyError.
     """
+    prefetched = list(state["input"].prefetched_chunks)
     return {
         "memory_results":          None,
         "entity_context":          [],
         "route":                   None,
         "revalidation_needed":     None,
-        "retrieved_chunks":        [],
+        "retrieved_chunks":        prefetched,
         "sub_claims":              [],
         "debate_transcript":       None,
         "source_credibility":      None,
@@ -157,7 +158,7 @@ def freshness_check(state: FactCheckState, settings) -> dict:
         verdict_confidence = best.verdict_confidence or 0.0,
         last_verified_at   = last_verified_at,
         api_key            = settings.openai_api_key,
-        model              = settings.llm_model,
+        model              = _llm_factory.llm_model_name(),
     )
     return {"revalidation_needed": result["revalidate"]}
 
@@ -165,7 +166,13 @@ def freshness_check(state: FactCheckState, settings) -> dict:
 # ── Node: live_search ─────────────────────────────────────────────────────────
 
 def live_search(state: FactCheckState, settings) -> dict:
-    """Live path: search Tavily for current evidence."""
+    """Live path: search Tavily for current evidence.
+
+    Skips the Tavily call when prefetched_chunks were provided (e.g. Factify2 Option A eval).
+    """
+    if state.get("retrieved_chunks"):
+        logger.info("live_search: skipping Tavily — using %d pre-fetched chunks", len(state["retrieved_chunks"]))
+        return {"route": "live_search"}
     results          = search_live(state["input"].claim_text, api_key=settings.tavily_api_key)
     context, _links  = format_search_context(results)
     logger.info("live_search: %d results", len(results))
@@ -231,10 +238,10 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
         source_credibility_note=source_credibility_note,
     )
 
-    client = OpenAI(api_key=settings.openai_api_key)
+    client = _llm_factory.make_llm_client()
     try:
         response = client.chat.completions.create(
-            model=settings.llm_model,
+            model=_llm_factory.llm_model_name(),
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0,
@@ -289,7 +296,7 @@ def cross_modal_check(state: FactCheckState, settings) -> dict:
         claim_text    = inp.claim_text,
         image_caption = inp.image_caption,
         api_key       = settings.openai_api_key,
-        model         = settings.llm_model,
+        model         = _llm_factory.llm_model_name(),
     )
 
     current_output: Optional[FactCheckOutput] = state.get("output")

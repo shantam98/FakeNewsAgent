@@ -15,8 +15,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from openai import OpenAI
-
+import fact_check_agent.src.llm_factory as _llm_factory
 from fact_check_agent.src.prompts import FRESHNESS_CHECK_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -60,7 +59,7 @@ def check_freshness(
         time_since_verified_days=time_since_verified_days,
     )
 
-    client = OpenAI(api_key=api_key)
+    client = _llm_factory.make_llm_client()
     try:
         response = client.chat.completions.create(
             model=model,

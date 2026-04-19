@@ -41,7 +41,9 @@ htmlcov/
 
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
-*.ipynb
+
+# ── Datasets (large files — download locally, never commit) ──────────────────
+datasets/
 
 # ── Benchmark artefacts ───────────────────────────────────────────────────────
 caption_cache.pkl

@@ -94,13 +94,11 @@ def test_graph_live_search_path_returns_output():
     xmodal  = make_openai_cross_modal_response()
 
     with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
-         patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
+         patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_llm:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
-        # Both synthesize_verdict and cross_modal_check use OpenAI — set both
-        mock_synth_cls.return_value.chat.completions.create.return_value = verdict
-        mock_cm_cls.return_value.chat.completions.create.return_value = xmodal
+        # synthesize_verdict runs first, cross_modal_check second
+        mock_llm.return_value.chat.completions.create.side_effect = [verdict, xmodal]
 
         graph = build_graph(memory)
         state = graph.invoke({"input": make_fact_check_input()})
@@ -120,20 +118,11 @@ def test_graph_writes_verdict_to_memory():
     xmodal  = make_openai_cross_modal_response()
 
     with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
-         patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls, \
-         patch("fact_check_agent.src.graph.nodes.write_memory.__module__"):
-        pass  # patch context handled below
-
-    with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
-         patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
+         patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_llm:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
-        mock_synth_cls.return_value.chat.completions.create.return_value = verdict
-        mock_cm_cls.return_value.chat.completions.create.return_value = xmodal
+        mock_llm.return_value.chat.completions.create.side_effect = [verdict, xmodal]
 
-        # Also patch the Verdict import inside write_memory
         with patch("fact_check_agent.src.graph.nodes.write_memory") as mock_write:
             mock_write.return_value = {}
             graph  = build_graph(memory)
@@ -156,12 +145,10 @@ def test_graph_verdict_fields_populated():
     xmodal  = make_openai_cross_modal_response(conflict=False)
 
     with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
-         patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
+         patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_llm:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
-        mock_synth_cls.return_value.chat.completions.create.return_value = verdict
-        mock_cm_cls.return_value.chat.completions.create.return_value = xmodal
+        mock_llm.return_value.chat.completions.create.side_effect = [verdict, xmodal]
 
         graph = build_graph(memory)
         state = graph.invoke({"input": make_fact_check_input()})
@@ -185,12 +172,10 @@ def test_graph_cross_modal_flag_propagated():
     xmodal.choices[0].message.content = xmodal_content
 
     with patch("fact_check_agent.src.tools.live_search_tool.TavilyClient") as mock_tavily, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.OpenAI") as mock_cm_cls, \
-         patch("fact_check_agent.src.graph.nodes.OpenAI") as mock_synth_cls:
+         patch("fact_check_agent.src.llm_factory.make_llm_client") as mock_llm:
 
         mock_tavily.return_value.search.return_value = make_tavily_response()
-        mock_synth_cls.return_value.chat.completions.create.return_value = verdict
-        mock_cm_cls.return_value.chat.completions.create.return_value = xmodal
+        mock_llm.return_value.chat.completions.create.side_effect = [verdict, xmodal]
 
         graph = build_graph(memory)
         state = graph.invoke({"input": make_fact_check_input(image_caption="Caption text")})
