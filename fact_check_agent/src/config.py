@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_top_k: int = 5           # final number of chunks passed to synthesizer
 
+    # Cross-modal consistency — SigLIP
+    use_siglip: bool = False          # use SigLIP embedding similarity instead of VLM for image check
+    siglip_model: str = "google/siglip-base-patch16-224"
+    siglip_threshold: float = 0.15    # sigmoid probability below this → conflict flagged
+
     # LangSmith tracing
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""

@@ -1,52 +1,36 @@
 """Tests for the cross-modal tool.
 
-Unit tests use mocks (no API keys / Ollama required).
-Integration tests (marked `ollama`) call Gemma 4 via local Ollama — skipped
-automatically when Ollama is not running.
+Unit tests: mocked — no API keys, Ollama, or model downloads required.
+SigLIP integration: runs locally (transformers + torch), no external services.
+Ollama integration: marked `requires_ollama`, auto-skipped when Ollama is down.
 """
+import base64
+import io
 import json
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from fact_check_agent.src.tools.cross_modal_tool import (
     check_cross_modal,
+    _siglip_check,
     _vision_check,
-    _llm_check,
 )
 
-# ── Test images — tiny base64 PNGs with scene labels ─────────────────────────
 
-# Red/orange scene labelled "WILDFIRE SCENE" — clearly a fire context
-_FIRE_IMAGE = (
-    "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUG"
-    "BwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/wAAR"
-    "CAB4AMgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgED"
-    "AwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcY"
-    "GRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJ"
-    "ipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo"
-    "6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQD"
-    "BAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcY"
-    "GRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImK"
-    "kpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
-    "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD..."
-)
+# ── Shared test image factory ─────────────────────────────────────────────────
 
-# Blue scene labelled "PEACEFUL OCEAN" — clearly a calm water context
-_OCEAN_IMAGE = (
-    "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUG"
-    "BwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/wAAR"
-    "CAB4AMgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgED"
-    "AwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcY"
-    "GRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJ"
-    "ipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo"
-    "6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQD"
-    "BAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcY"
-    "GRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImK"
-    "kpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
-    "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD..."
-)
+def _make_image_uri(color=(200, 60, 20), labels=None, size=(200, 120)) -> str:
+    """Return a base64 data URI for a simple PIL test image."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, color=color)
+    if labels:
+        d = ImageDraw.Draw(img)
+        for y, text in labels:
+            d.text((10, y), text, fill=(255, 255, 255))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
 def _ollama_running() -> bool:
@@ -60,13 +44,13 @@ def _ollama_running() -> bool:
 
 requires_ollama = pytest.mark.skipif(
     not _ollama_running(),
-    reason="Ollama not running — skipping vision integration tests",
+    reason="Ollama not running — skipping vision LLM integration tests",
 )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _mock_response(conflict: bool, explanation=None):
+def _mock_llm_response(conflict: bool, explanation=None):
     content = json.dumps({"conflict": conflict, "explanation": explanation})
     choice = MagicMock()
     choice.message.content = content
@@ -83,6 +67,7 @@ def test_no_image_data_returns_no_flag():
     )
     assert result["flag"] is False
     assert result["explanation"] is None
+    assert result["siglip_score"] is None
 
 
 def test_empty_caption_no_url_returns_no_flag():
@@ -96,26 +81,25 @@ def test_empty_caption_no_url_returns_no_flag():
 
 def test_caption_path_no_conflict():
     with patch("fact_check_agent.src.llm_factory.make_llm_client") as mk:
-        mk.return_value.chat.completions.create.return_value = _mock_response(False)
+        mk.return_value.chat.completions.create.return_value = _mock_llm_response(False)
         result = check_cross_modal(
             claim_text="Vaccines are safe.",
             image_caption="Doctor administering vaccine to patient.",
-            api_key="k",
-            model="gpt-4o",
+            api_key="k", model="gpt-4o",
         )
     assert result["flag"] is False
+    assert result["siglip_score"] is None
 
 
 def test_caption_path_conflict():
     with patch("fact_check_agent.src.llm_factory.make_llm_client") as mk:
-        mk.return_value.chat.completions.create.return_value = _mock_response(
+        mk.return_value.chat.completions.create.return_value = _mock_llm_response(
             True, "Image shows protest but claim says peaceful gathering."
         )
         result = check_cross_modal(
             claim_text="The rally was peaceful.",
             image_caption="Police disperse violent crowd.",
-            api_key="k",
-            model="gpt-4o",
+            api_key="k", model="gpt-4o",
         )
     assert result["flag"] is True
     assert result["explanation"] is not None
@@ -130,127 +114,141 @@ def test_caption_path_llm_failure_degrades_gracefully():
     assert result["flag"] is False
 
 
-# ── Unit: vision dispatch (ollama provider) ───────────────────────────────────
+# ── Unit: dispatch routing ────────────────────────────────────────────────────
 
-def test_image_url_with_ollama_dispatches_to_vision():
-    """When image_url + ollama provider, _vision_check is called not _llm_check."""
+def test_siglip_path_takes_priority_over_vision():
+    """use_siglip=True routes to _siglip_check regardless of llm_provider."""
     with patch("fact_check_agent.src.tools.cross_modal_tool.settings") as ms, \
-         patch("fact_check_agent.src.tools.cross_modal_tool._vision_check") as mv, \
-         patch("fact_check_agent.src.tools.cross_modal_tool._llm_check") as ml:
+         patch("fact_check_agent.src.tools.cross_modal_tool._siglip_check") as msiglip, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._vision_check") as mvision, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._llm_check") as mllm:
+        ms.use_siglip = True
         ms.llm_provider = "ollama"
-        mv.return_value = {"conflict": False, "explanation": None}
+        msiglip.return_value = {"conflict": False, "explanation": None, "siglip_score": 0.8}
         check_cross_modal(
             claim_text="A claim", image_caption=None, api_key="", model="",
-            image_url="http://example.com/img.jpg",
+            image_url="data:image/jpeg;base64,/9j/fake",
         )
-    mv.assert_called_once()
-    ml.assert_not_called()
+    msiglip.assert_called_once()
+    mvision.assert_not_called()
+    mllm.assert_not_called()
 
 
-def test_image_url_without_ollama_falls_back_to_caption():
-    """When image_url present but provider is openai, caption path is used."""
+def test_vision_path_when_siglip_disabled_and_ollama():
+    """use_siglip=False + ollama provider → _vision_check."""
     with patch("fact_check_agent.src.tools.cross_modal_tool.settings") as ms, \
-         patch("fact_check_agent.src.tools.cross_modal_tool._vision_check") as mv, \
-         patch("fact_check_agent.src.tools.cross_modal_tool._llm_check") as ml:
-        ms.llm_provider = "openai"
-        ml.return_value = {"conflict": False, "explanation": None}
+         patch("fact_check_agent.src.tools.cross_modal_tool._siglip_check") as msiglip, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._vision_check") as mvision, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._llm_check") as mllm:
+        ms.use_siglip = False
+        ms.llm_provider = "ollama"
+        mvision.return_value = {"conflict": False, "explanation": None}
         check_cross_modal(
-            claim_text="A claim", image_caption="A caption", api_key="k", model="gpt-4o",
-            image_url="http://example.com/img.jpg",
+            claim_text="A claim", image_caption=None, api_key="", model="",
+            image_url="data:image/jpeg;base64,/9j/fake",
         )
-    mv.assert_not_called()
-    ml.assert_called_once()
+    msiglip.assert_not_called()
+    mvision.assert_called_once()
+    mllm.assert_not_called()
+
+
+def test_llm_caption_path_when_no_image_url():
+    """No image_url → _llm_check regardless of provider."""
+    with patch("fact_check_agent.src.tools.cross_modal_tool.settings") as ms, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._siglip_check") as msiglip, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._vision_check") as mvision, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._llm_check") as mllm:
+        ms.use_siglip = True
+        ms.llm_provider = "ollama"
+        mllm.return_value = {"conflict": False, "explanation": None}
+        check_cross_modal(
+            claim_text="A claim", image_caption="A caption", api_key="k", model="m",
+        )
+    msiglip.assert_not_called()
+    mvision.assert_not_called()
+    mllm.assert_called_once()
+
+
+def test_siglip_score_surfaces_in_return_value():
+    """siglip_score from _siglip_check is passed through to the caller."""
+    with patch("fact_check_agent.src.tools.cross_modal_tool.settings") as ms, \
+         patch("fact_check_agent.src.tools.cross_modal_tool._siglip_check") as msiglip:
+        ms.use_siglip = True
+        ms.llm_provider = "openai"
+        msiglip.return_value = {"conflict": True, "explanation": "low score", "siglip_score": 0.04}
+        result = check_cross_modal(
+            claim_text="A claim", image_caption=None, api_key="", model="",
+            image_url="data:image/jpeg;base64,/9j/fake",
+        )
+    assert result["flag"] is True
+    assert result["siglip_score"] == pytest.approx(0.04)
+
+
+# ── Integration: SigLIP local model ──────────────────────────────────────────
+
+def test_siglip_check_returns_valid_shape():
+    """_siglip_check returns a dict with conflict (bool), explanation, and siglip_score (float 0-1)."""
+    uri = _make_image_uri(
+        color=(20, 80, 180),
+        labels=[(20, "ocean"), (55, "calm water"), (90, "blue sea")],
+    )
+    result = _siglip_check(
+        claim_text="A photo of a calm ocean with blue water.",
+        image_url=uri,
+    )
+    assert isinstance(result, dict)
+    assert isinstance(result["conflict"], bool)
+    assert result["explanation"] is None or isinstance(result["explanation"], str)
+    assert isinstance(result["siglip_score"], float)
+    assert 0.0 <= result["siglip_score"] <= 1.0
+
+
+def test_siglip_check_score_higher_for_matching_text():
+    """A visually blue image should score higher against ocean text than fire text."""
+    ocean_uri = _make_image_uri(color=(20, 80, 180))
+    from fact_check_agent.src.tools.cross_modal_tool import _siglip_check
+    r_match    = _siglip_check("a calm blue ocean with clear water", ocean_uri)
+    r_mismatch = _siglip_check("a raging wildfire with flames and smoke", ocean_uri)
+    assert r_match["siglip_score"] > r_mismatch["siglip_score"], (
+        f"Expected match score ({r_match['siglip_score']:.4f}) > "
+        f"mismatch score ({r_mismatch['siglip_score']:.4f})"
+    )
+
+
+def test_siglip_model_cached_across_calls():
+    """_load_siglip is called only once even for multiple checks (lru_cache)."""
+    from fact_check_agent.src.tools.cross_modal_tool import _load_siglip
+    uri = _make_image_uri()
+    _siglip_check("first call", uri)
+    cache_info_before = _load_siglip.cache_info()
+    _siglip_check("second call", uri)
+    cache_info_after = _load_siglip.cache_info()
+    assert cache_info_after.hits > cache_info_before.hits
+
+
+def test_siglip_graceful_fallback_on_bad_image():
+    """Corrupt base64 image data returns conflict=False without raising."""
+    result = _siglip_check(
+        claim_text="some claim",
+        image_url="data:image/jpeg;base64,NOTVALIDBASE64!!!",
+    )
+    assert result["conflict"] is False
+    assert result["siglip_score"] is None
 
 
 # ── Integration: Gemma 4 vision via Ollama ────────────────────────────────────
 
 @requires_ollama
 def test_vision_check_returns_valid_json_shape():
-    """Smoke test: Gemma 4 returns a dict with conflict (bool) and explanation."""
-    import urllib.request, base64, io
-    from PIL import Image, ImageDraw
-
-    # Build a small but clear fire/red scene image
-    img = Image.new("RGB", (200, 120), color=(200, 60, 20))
-    d = ImageDraw.Draw(img)
-    for y, text in [(20, "WILDFIRE SCENE"), (50, "Buildings Burning"), (80, "Evacuation Zone")]:
-        d.text((10, y), text, fill=(255, 240, 0))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    fire_uri = f"data:image/jpeg;base64,{b64}"
-
+    """Gemma 4 returns a dict with conflict (bool) and explanation fields."""
+    uri = _make_image_uri(
+        color=(200, 60, 20),
+        labels=[(20, "WILDFIRE SCENE"), (55, "Buildings Burning"), (90, "Evacuation Zone")],
+    )
     result = _vision_check(
         claim_text="This photo shows a peaceful ocean sunset with calm waters.",
-        image_url=fire_uri,
+        image_url=uri,
     )
-
-    assert isinstance(result, dict), f"Expected dict, got {type(result)}"
-    assert "conflict" in result, f"Missing 'conflict' key: {result}"
-    assert isinstance(result["conflict"], bool), f"conflict must be bool: {result}"
-    assert "explanation" in result, f"Missing 'explanation' key: {result}"
-
-
-@requires_ollama
-def test_vision_returns_bool_conflict_field():
-    """Gemma 4 returns a valid bool for conflict — not testing specific verdict,
-    only that the model responds with parseable JSON and the right field types.
-
-    Note: gemma4:e2b (2B params) is too small for reliable cross-modal reasoning;
-    larger models produce more accurate verdicts. This test verifies API integration.
-    """
-    import base64, io
-    from PIL import Image, ImageDraw
-
-    img = Image.new("RGB", (200, 120), color=(200, 60, 20))
-    d = ImageDraw.Draw(img)
-    for y, text in [(20, "WILDFIRE SCENE"), (50, "FIRE EMERGENCY"), (80, "Buildings Ablaze")]:
-        d.text((10, y), text, fill=(255, 240, 0))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    fire_uri = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-
-    result = _vision_check(
-        claim_text="This peaceful ocean photo shows calm blue waters and a clear sky.",
-        image_url=fire_uri,
-    )
-
-    assert isinstance(result.get("conflict"), bool), f"conflict must be bool: {result}"
-    # explanation is either None or a string
+    assert isinstance(result, dict)
+    assert isinstance(result.get("conflict"), bool)
     assert result.get("explanation") is None or isinstance(result["explanation"], str)
-
-
-@requires_ollama
-def test_check_cross_modal_vision_end_to_end():
-    """Full check_cross_modal call dispatches to vision when provider=ollama."""
-    import base64, io
-    from PIL import Image, ImageDraw
-    from unittest.mock import patch
-
-    img = Image.new("RGB", (200, 120), color=(200, 60, 20))
-    d = ImageDraw.Draw(img)
-    d.text((10, 40), "WILDFIRE", fill=(255, 240, 0))
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    fire_uri = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
-
-    # Force ollama provider for this call
-    with patch("fact_check_agent.src.tools.cross_modal_tool.settings") as ms, \
-         patch("fact_check_agent.src.tools.cross_modal_tool.settings.ollama_base_url",
-               "http://localhost:11434/v1", create=True), \
-         patch("fact_check_agent.src.tools.cross_modal_tool.settings.ollama_llm_model",
-               "gemma4:e2b", create=True):
-        ms.llm_provider = "ollama"
-        ms.ollama_base_url = "http://localhost:11434/v1"
-        ms.ollama_llm_model = "gemma4:e2b"
-        result = check_cross_modal(
-            claim_text="This photo shows a calm ocean sunset.",
-            image_caption=None,
-            api_key="",
-            model="",
-            image_url=fire_uri,
-        )
-
-    assert "flag" in result
-    assert "explanation" in result
-    assert isinstance(result["flag"], bool)

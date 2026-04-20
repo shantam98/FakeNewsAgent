@@ -1,15 +1,21 @@
 """Cross-modal consistency tool — checks for conflicts between claim text and image.
 
-Two modes:
-  1. Vision mode (preferred): sends the raw image URL to Gemma 4 via Ollama.
-     Activated when `image_url` is provided and `llm_provider == "ollama"`.
-  2. Caption mode (fallback): sends claim + text caption to any LLM.
-     Used when no image URL is available or when using OpenAI.
+Three modes (selected in priority order when image_url is provided):
+  1. SigLIP mode: local embedding similarity via google/siglip-base-patch16-224.
+     Fast, deterministic, no API calls. Activated by `use_siglip=True` in settings.
+  2. Vision LLM mode: sends image to Gemma 4 via Ollama for reasoning-based check.
+     Activated when `llm_provider == "ollama"` and SigLIP is disabled.
+  3. Caption mode (fallback): sends claim + text caption to any LLM.
+     Used when no image_url is available.
 
-CLIP scoring (S5 original design) is removed — Gemma 4 vision supersedes it.
+SigLIP scores the probability that a (image, text) pair is a match.
+Low probability → claim doesn't describe the image → potential conflict.
 """
+import base64
+import io
 import json
 import logging
+from functools import lru_cache
 from typing import Optional
 
 from openai import OpenAI
@@ -19,6 +25,69 @@ from fact_check_agent.src.config import settings
 from fact_check_agent.src.prompts import CROSS_MODAL_PROMPT, CROSS_MODAL_VISION_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _load_siglip(model_name: str):
+    """Load SigLIP model and processor once, cache for reuse."""
+    from transformers import AutoProcessor, AutoModel
+    logger.info("Loading SigLIP model: %s", model_name)
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+    return processor, model
+
+
+def _decode_image(image_url: str):
+    """Return a PIL Image from a base64 data URI or an https:// URL."""
+    from PIL import Image as PILImage
+
+    if image_url.startswith("data:"):
+        # data:image/jpeg;base64,<b64>
+        header, b64 = image_url.split(",", 1)
+        return PILImage.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+
+    import urllib.request
+    with urllib.request.urlopen(image_url, timeout=10) as r:
+        return PILImage.open(io.BytesIO(r.read())).convert("RGB")
+
+
+def _siglip_check(claim_text: str, image_url: str) -> dict:
+    """Compute SigLIP image-text similarity.
+
+    Returns conflict=True when the sigmoid probability that (image, claim)
+    is a matching pair falls below settings.siglip_threshold.
+    """
+    import torch
+
+    try:
+        processor, model = _load_siglip(settings.siglip_model)
+        image = _decode_image(image_url)
+
+        inputs = processor(
+            text=[claim_text],
+            images=[image],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+        )
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # logits_per_image shape: (n_images, n_texts)
+            prob = torch.sigmoid(outputs.logits_per_image[0, 0]).item()
+
+        conflict = prob < settings.siglip_threshold
+        explanation = (
+            f"SigLIP match probability {prob:.3f} is below threshold "
+            f"{settings.siglip_threshold} — image likely does not match claim."
+            if conflict else None
+        )
+        logger.debug("SigLIP score=%.3f threshold=%.3f conflict=%s", prob, settings.siglip_threshold, conflict)
+        return {"conflict": conflict, "explanation": explanation, "siglip_score": prob}
+
+    except Exception as e:
+        logger.error("SigLIP check failed: %s", e)
+        return {"conflict": False, "explanation": None, "siglip_score": None}
 
 
 def check_cross_modal(
@@ -31,20 +100,26 @@ def check_cross_modal(
     """Check for logical conflicts between claim text and image/caption.
 
     Returns:
-        {"flag": bool, "explanation": str | None}
+        {"flag": bool, "explanation": str | None, "siglip_score": float | None}
     """
     if not image_url and not image_caption:
         logger.debug("No image data — skipping cross-modal check")
-        return {"flag": False, "explanation": None}
+        return {"flag": False, "explanation": None, "siglip_score": None}
 
-    if image_url and settings.llm_provider == "ollama":
+    siglip_score = None
+
+    if image_url and settings.use_siglip:
+        result = _siglip_check(claim_text, image_url)
+        siglip_score = result.get("siglip_score")
+    elif image_url and settings.llm_provider == "ollama":
         result = _vision_check(claim_text, image_url)
     else:
         result = _llm_check(claim_text, image_caption or "", api_key, model)
 
     return {
-        "flag":        result.get("conflict", False),
-        "explanation": result.get("explanation"),
+        "flag":         result.get("conflict", False),
+        "explanation":  result.get("explanation"),
+        "siglip_score": siglip_score,
     }
 
 
@@ -65,7 +140,6 @@ def _vision_check(claim_text: str, image_url: str) -> dict:
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown fences if model adds them despite the prompt instruction
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
