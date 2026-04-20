@@ -48,7 +48,7 @@ def build_graph(memory: "MemoryAgent"):
         A compiled LangGraph StateGraph.
     """
     # Bind memory and settings into nodes that need them via closures
-    def _query_memory(state):      return query_memory(state, memory)
+    def _query_memory(state):      return query_memory(state, memory, settings)
     def _freshness_check(state):   return freshness_check(state, settings)
     def _live_search(state):       return live_search(state, settings)
     def _synthesize_verdict(state):return synthesize_verdict(state, settings)

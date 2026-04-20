@@ -91,8 +91,10 @@ Each item is partially implemented behind a flag or comment. Enable in order of 
 
 ### S1 · GraphRAG
 **File:** `fact_check_agent/src/graph/nodes.py` — `query_memory` node  
-**Enable:** Add `get_entity_claims()` call after the vector similarity search.  
-**Status:** Neo4j graph is written but never read during retrieval.
+**Enable:** Set `USE_GRAPH_RAG=true` in `.env`.  
+**Status:** ✅ Implemented. RRF merge + optional cross-encoder reranking in `src/tools/reranker.py`. Toggle `USE_CROSS_ENCODER=true` to activate cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`, already downloaded). Both flags default to `false` — enable after baseline eval.
+
+**Verdict revision also implemented:** Verdicts now carry `status=active/superseded`. Re-running on a known claim auto-supersedes the old verdict and creates a `SUPERSEDES` edge in Neo4j. Full audit history preserved; only active verdicts surface in queries.
 
 **What:** After finding similar claims via vector search, also traverse the Neo4j graph to pull in all past verdicts for entities mentioned in the current claim — regardless of semantic similarity.
 
@@ -102,15 +104,15 @@ Each item is partially implemented behind a flag or comment. Enable in order of 
 
 ---
 
-### S2 · Self-RAG (Retrieval Gating)
+### S2 · Adaptive Retrieval Gate
 **File:** `fact_check_agent/src/graph/nodes.py` — before `live_search` node  
 **Enable:** Wire `IS_RETRIEVAL_NEEDED_PROMPT` as a pre-check before calling Tavily.  
 **Status:** Prompt exists in `src/prompts.py` but the gating node is not wired in.
 
-**What:** Before spending a Tavily search credit, ask the LLM: *"Given this claim and the already-retrieved context, is additional web search needed?"* If no, skip live search entirely.
+**What:** Before spending a Tavily search credit, ask the LLM: *"Given this claim and the already-retrieved context, is additional web search needed?"* If no, skip live search entirely. This is sometimes loosely called Self-RAG in the literature, but that term properly refers to a fine-tuned model that generates inline reflection tokens (`[Retrieve]`, `[IsRel]`, `[IsSup]`) — what we have here is simpler: a prompt-based yes/no gate, no fine-tuning required.
 
-**Example:** Claim: *"The Eiffel Tower is in Paris."* The RAG retrieval already returned a Wikipedia chunk confirming this. Self-RAG would gate out the Tavily call — saving a credit and ~1s of latency — since the existing evidence is already conclusive.  
-Conversely, for a breaking-news claim about an event from last week, RAG finds nothing useful and Self-RAG correctly allows the live search to proceed.
+**Example:** Claim: *"The Eiffel Tower is in Paris."* The RAG retrieval already returned a Wikipedia chunk confirming this. The gate would short-circuit the Tavily call — saving a credit and ~1s of latency — since the existing evidence is already conclusive.  
+Conversely, for a breaking-news claim about an event from last week, RAG finds nothing useful and the gate correctly allows the live search to proceed.
 
 **Why it matters:** Reduces Tavily API cost and latency for claims that are already well-covered by the knowledge base.
 
@@ -145,16 +147,18 @@ The aggregation rule (e.g., *any refuted sub-claim → overall refuted*) is conf
 
 ---
 
-### S5 · CLIP Cross-Modal Consistency
+### S5 · Gemma 4 Vision Cross-Modal Consistency
 **File:** `fact_check_agent/src/tools/cross_modal_tool.py`  
-**Enable:** Set `ENABLE_CLIP = True`.  
-**Status:** GPT-4o vision captioning is active; CLIP embedding comparison is disabled.
+**Enable:** Set `LLM_PROVIDER=ollama` in `.env` and pass `image_url` to `check_cross_modal`.  
+**Status:** ✅ Implemented. CLIP stub removed. Gemma 4 via Ollama receives the raw image URL (base64) + claim text and returns structured JSON `{"conflict": bool, "explanation": str | null}`.
 
-**What:** Instead of (or alongside) VLM captioning, compute CLIP embeddings for both the image and the claim text and measure their cosine similarity directly — no LLM call needed.
+**What:** Send the raw image directly to Gemma 4 via Ollama's vision API alongside the claim text. No separate captioning step — the model sees the image and the claim in one pass and identifies logical conflicts.
 
-**Example:** An article claims *"Protesters destroyed parliament building"* alongside an image that is actually from a football riot in 2018. GPT-4o captioning describes the image accurately but the cross-modal inconsistency check still requires an LLM to compare. CLIP would flag the mismatch in milliseconds by computing that the image embedding is far from the claim text embedding in joint vision-language space — and do it without an API call.
+**Example:** An article claims *"Protesters destroyed parliament building"* alongside an image that is actually from a football riot in 2018. Gemma 4 receives the image and claim together and flags the mismatch: *"The image shows a sports crowd, not a parliament building."* No caption intermediary needed.
 
-**Why it matters:** Faster, cheaper, and doesn't hallucinate. GPT-4o captioning remains as a fallback for complex scenes CLIP misclassifies.
+**Why it matters:** Eliminates the caption → compare two-step pipeline. The vision model reasons about the image and claim in a single call. Falls back to text-caption LLM check when `image_url` is not available or provider is OpenAI.
+
+**Known limitation:** `gemma4:e2b` (2B params) is borderline for reliable cross-modal reasoning. Larger models (gemma4:12b, gemma4:27b) produce more accurate conflict detection. Integration test verifies the API wiring, not verdict accuracy.
 
 ---
 

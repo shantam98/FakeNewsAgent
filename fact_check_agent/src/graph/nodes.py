@@ -19,6 +19,7 @@ from fact_check_agent.src.tools.cross_modal_tool import check_cross_modal
 from fact_check_agent.src.tools.freshness_tool import check_freshness
 from fact_check_agent.src.tools.live_search_tool import format_search_context, search_live
 from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
+from fact_check_agent.src.tools.reranker import rerank_candidates
 from fact_check_agent.src.models.schemas import (
     FactCheckOutput,
     MemoryQueryResponse,
@@ -62,12 +63,36 @@ def receive_claim(state: FactCheckState) -> dict:
 
 # ── Node: query_memory ────────────────────────────────────────────────────────
 
-def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
-    """Query MemoryAgent: similar claims (vector), entity context (graph)."""
+def query_memory(state: FactCheckState, memory: "MemoryAgent", settings=None) -> dict:
+    """Query MemoryAgent: similar claims (vector) + optional GraphRAG + reranking."""
+    from fact_check_agent.src.config import settings as _settings
+    if settings is None:
+        settings = _settings
+
     inp = state["input"]
 
-    similar     = retrieve_similar_claims(inp.claim_text, memory)
-    entity_ctx  = memory.get_entity_context(inp.claim_id)
+    # ── Stage 1: vector similarity search ────────────────────────────────
+    vector_results = retrieve_similar_claims(inp.claim_text, memory)
+    entity_ctx     = memory.get_entity_context(inp.claim_id)
+
+    # ── Stage 2: GraphRAG — expand via entity-claim traversal ────────────
+    graph_results: list[dict] = []
+    if settings.use_graph_rag and vector_results:
+        claim_ids  = [c["claim_id"] for c in vector_results]
+        entity_ids = [e["entity_id"] for e in memory.get_entity_ids_for_claims(claim_ids)]
+        if entity_ids:
+            graph_results = memory.get_graph_claims_for_entities(entity_ids)
+            logger.info("GraphRAG: %d entities → %d graph claims", len(entity_ids), len(graph_results))
+
+    # ── Stage 3: RRF merge + optional cross-encoder rerank ───────────────
+    reranked = rerank_candidates(
+        query              = inp.claim_text,
+        vector_results     = vector_results,
+        graph_results      = graph_results,
+        use_cross_encoder  = settings.use_cross_encoder,
+        cross_encoder_model= settings.cross_encoder_model,
+        top_k              = settings.reranker_top_k,
+    )
 
     results = [
         SimilarClaim(
@@ -75,10 +100,10 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
             claim_text         = c["claim_text"],
             verdict_label      = c.get("verdict_label"),
             verdict_confidence = c.get("verdict_confidence"),
-            distance           = c["distance"],
+            distance           = c.get("distance", 0.0),
             verified_at        = c.get("verified_at"),
         )
-        for c in similar
+        for c in reranked
     ]
 
     max_confidence = max(
@@ -86,11 +111,9 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
         default=0.0,
     )
 
-    # Surface the verified_at of the best (highest-confidence) result for freshness_check
     best = next((r for r in results if r.verdict_confidence == max_confidence and r.verified_at), None)
     last_verified_at = best.verified_at if best else None
 
-    # Query Reflection Agent for (source, topic) credibility history
     source_cred = query_source_credibility(
         claim_text = inp.claim_text,
         source_url = inp.source_url,
@@ -98,16 +121,17 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
     )
 
     logger.info(
-        "query_memory: %d similar claims, max_confidence=%.2f, %d entities, "
-        "source_cred_samples=%d",
-        len(results), max_confidence, len(entity_ctx),
+        "query_memory: %d vector + %d graph → %d reranked, max_confidence=%.2f, "
+        "graph_rag=%s, cross_encoder=%s, source_cred_samples=%d",
+        len(vector_results), len(graph_results), len(results), max_confidence,
+        settings.use_graph_rag, settings.use_cross_encoder,
         source_cred.get("sample_count", 0),
     )
 
     return {
-        "memory_results":    MemoryQueryResponse(results=results, max_confidence=max_confidence),
-        "entity_context":    entity_ctx,
-        "last_verified_at":  last_verified_at,
+        "memory_results":     MemoryQueryResponse(results=results, max_confidence=max_confidence),
+        "entity_context":     entity_ctx,
+        "last_verified_at":   last_verified_at,
         "source_credibility": source_cred,
     }
 

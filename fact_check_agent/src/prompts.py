@@ -67,6 +67,29 @@ Return JSON:
 }}
 """
 
+# ── v1.1 vision cross-modal (Gemma 4 / Ollama) ───────────────────────────────
+
+CROSS_MODAL_VISION_PROMPT = """\
+You are checking whether a news image is being used in a misleading context.
+
+[CLAIM TEXT]
+{claim_text}
+
+Look at the image above carefully. Identify only clear logical conflicts between what the \
+claim states and what the image objectively shows. Do NOT flag:
+- Stylistic mismatches or tone differences
+- Missing information (absence of evidence is not conflict)
+- Speculative or inferred connections
+
+If there is a clear, direct logical conflict, explain it in one concise sentence.
+
+Return JSON only — no markdown fences:
+{{
+  "conflict": true | false,
+  "explanation": "<one sentence describing the conflict, or null if no conflict>"
+}}
+"""
+
 # ── v1.0 freshness classifier ────────────────────────────────────────────────
 
 FRESHNESS_CHECK_PROMPT = """\
