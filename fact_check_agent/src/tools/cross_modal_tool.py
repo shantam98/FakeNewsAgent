@@ -123,17 +123,39 @@ def check_cross_modal(
     }
 
 
+def _ensure_base64_uri(image_url: str) -> str:
+    """Convert an https:// image URL to a base64 data URI if needed.
+
+    Ollama's vision API only accepts base64 data URIs, not external HTTP URLs.
+    SigLIP can handle both formats (via _decode_image), so this is only needed
+    for the _vision_check (Gemma4) path.
+    """
+    if image_url.startswith("data:"):
+        return image_url
+    try:
+        import urllib.request
+        with urllib.request.urlopen(image_url, timeout=10) as r:
+            content_type = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            raw = r.read()
+        b64 = base64.b64encode(raw).decode()
+        return f"data:{content_type};base64,{b64}"
+    except Exception as e:
+        logger.warning("Could not fetch image %s: %s", image_url, e)
+        return image_url  # pass through; Ollama will likely fail gracefully
+
+
 def _vision_check(claim_text: str, image_url: str) -> dict:
     """Send image + claim to Gemma 4 via Ollama vision API."""
     client = OpenAI(base_url=settings.ollama_base_url, api_key="ollama")
     prompt = CROSS_MODAL_VISION_PROMPT.format(claim_text=claim_text)
+    image_data_uri = _ensure_base64_uri(image_url)
     try:
         response = client.chat.completions.create(
             model=settings.ollama_llm_model,
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": image_data_uri}},
                     {"type": "text", "text": prompt},
                 ],
             }],

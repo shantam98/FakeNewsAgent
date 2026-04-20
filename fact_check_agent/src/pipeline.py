@@ -39,6 +39,7 @@ def claim_to_fact_check_input(
     output: PreprocessingOutput,
     claim_index: int,
     image_caption: Optional[str],
+    image_url: Optional[str] = None,
 ) -> FactCheckInput:
     """Convert one Claim from a PreprocessingOutput into a typed FactCheckInput.
 
@@ -46,6 +47,7 @@ def claim_to_fact_check_input(
         output:        PreprocessingOutput produced by PreprocessingAgent.
         claim_index:   Which claim in output.claims to convert.
         image_caption: Pre-fetched VLM caption string, or None.
+        image_url:     Original image URL from ImageCaption (for SigLIP/vision check).
     """
     claim = output.claims[claim_index]
     return FactCheckInput(
@@ -63,6 +65,7 @@ def claim_to_fact_check_input(
         source_url    = output.article.url,
         article_id    = claim.article_id,
         image_caption = image_caption,
+        image_url     = image_url,
         timestamp     = claim.extracted_at,
     )
 
@@ -78,16 +81,18 @@ def run_fact_check(output: PreprocessingOutput) -> list[FactCheckOutput]:
     memory = get_memory()
     graph  = _get_graph()
 
-    # Pre-fetch image caption once for the article
+    # Pre-fetch image caption once for the article (both text and URL)
     caption_result = memory.get_caption_by_article(output.article.article_id)
-    image_caption: Optional[str] = (
-        caption_result["documents"][0]
-        if caption_result.get("documents") else None
-    )
+    image_caption: Optional[str] = None
+    image_url: Optional[str] = None
+    if caption_result.get("documents"):
+        image_caption = caption_result["documents"][0]
+    if caption_result.get("metadatas") and caption_result["metadatas"]:
+        image_url = caption_result["metadatas"][0].get("image_url")
 
     results: list[FactCheckOutput] = []
     for i in range(len(output.claims)):
-        fact_check_input = claim_to_fact_check_input(output, i, image_caption)
+        fact_check_input = claim_to_fact_check_input(output, i, image_caption, image_url)
         logger.info(
             "Running fact-check for claim %d/%d: %s",
             i + 1, len(output.claims), fact_check_input.claim_id,

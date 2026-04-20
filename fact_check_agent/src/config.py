@@ -59,7 +59,20 @@ class Settings(BaseSettings):
     # Cross-modal consistency — SigLIP
     use_siglip: bool = False          # use SigLIP embedding similarity instead of VLM for image check
     siglip_model: str = "google/siglip-base-patch16-224"
-    siglip_threshold: float = 0.15    # sigmoid probability below this → conflict flagged
+    siglip_threshold: float = 0.10    # sigmoid probability below this → conflict flagged
+
+    # S2 — Adaptive Retrieval Gate
+    use_retrieval_gate: bool = False  # ask LLM if live search is needed before calling Tavily
+
+    # S3 — Claim Decomposition
+    use_claim_decomposition: bool = False  # split compound claims before retrieval
+
+    # S4 — Multi-Agent Debate
+    use_debate: bool = False               # enable advocate/arbiter debate for low-confidence verdicts
+    debate_confidence_threshold: int = 70  # trigger debate when confidence_score < this value
+
+    # S6 — Freshness ReAct Agent
+    use_freshness_react: bool = False      # replace single LLM call with tool-calling ReAct loop
 
     # LangSmith tracing
     langchain_tracing_v2: bool = False

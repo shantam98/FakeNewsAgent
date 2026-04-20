@@ -185,15 +185,35 @@ def test_siglip_score_surfaces_in_return_value():
 
 
 # ── Integration: SigLIP local model ──────────────────────────────────────────
+#
+# Calibrated against real photos (see calibration run in repo history):
+#   Real photo + matching claim  → score 0.16–0.77
+#   Real photo + mismatching claim → score ~0.000
+#   Threshold: 0.10 (zero false positives, catches all real-photo mismatches)
+#
+# Grace Hopper image (matplotlib sample): score 0.16 for "woman in navy uniform"
+# Portrait photo: score 0.77 for "person's face portrait photo"
+# All mismatching pairs: score 0.000
+
+_GRACE_HOPPER = (
+    "/home/shantam/fakenews/.venv/lib/python3.10/site-packages"
+    "/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
+)
+_PORTRAIT = "/home/shantam/Downloads/portrait_photo.jpg"
+
+
+def _real_image_uri(path: str) -> str:
+    import base64
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:image/jpeg;base64,{b64}"
+
 
 def test_siglip_check_returns_valid_shape():
     """_siglip_check returns a dict with conflict (bool), explanation, and siglip_score (float 0-1)."""
-    uri = _make_image_uri(
-        color=(20, 80, 180),
-        labels=[(20, "ocean"), (55, "calm water"), (90, "blue sea")],
-    )
+    uri = _real_image_uri(_GRACE_HOPPER)
     result = _siglip_check(
-        claim_text="A photo of a calm ocean with blue water.",
+        claim_text="a woman in military navy uniform",
         image_url=uri,
     )
     assert isinstance(result, dict)
@@ -203,27 +223,53 @@ def test_siglip_check_returns_valid_shape():
     assert 0.0 <= result["siglip_score"] <= 1.0
 
 
-def test_siglip_check_score_higher_for_matching_text():
-    """A visually blue image should score higher against ocean text than fire text."""
-    ocean_uri = _make_image_uri(color=(20, 80, 180))
-    from fact_check_agent.src.tools.cross_modal_tool import _siglip_check
-    r_match    = _siglip_check("a calm blue ocean with clear water", ocean_uri)
-    r_mismatch = _siglip_check("a raging wildfire with flames and smoke", ocean_uri)
-    assert r_match["siglip_score"] > r_mismatch["siglip_score"], (
-        f"Expected match score ({r_match['siglip_score']:.4f}) > "
-        f"mismatch score ({r_mismatch['siglip_score']:.4f})"
+def test_siglip_matching_pair_above_threshold():
+    """Grace Hopper photo scores above threshold (0.10) for correct description."""
+    uri = _real_image_uri(_GRACE_HOPPER)
+    result = _siglip_check("a woman in military navy uniform", uri)
+    assert result["conflict"] is False, (
+        f"Expected no conflict for matching pair, got score={result['siglip_score']:.4f}"
     )
+    assert result["siglip_score"] > 0.10
+
+
+def test_siglip_mismatch_scores_near_zero():
+    """Grace Hopper photo + ocean claim scores near 0 (clear mismatch)."""
+    uri = _real_image_uri(_GRACE_HOPPER)
+    result = _siglip_check("a scenic ocean sunset with calm blue water", uri)
+    assert result["conflict"] is True, (
+        f"Expected conflict for mismatch pair, got score={result['siglip_score']:.4f}"
+    )
+    assert result["siglip_score"] < 0.05
+
+
+def test_siglip_portrait_match():
+    """Portrait photo scores high for 'person's face portrait photo'."""
+    uri = _real_image_uri(_PORTRAIT)
+    result = _siglip_check("a person's face portrait photo", uri)
+    assert result["siglip_score"] > 0.10, (
+        f"Portrait photo should score above threshold for person claim, got {result['siglip_score']:.4f}"
+    )
+    assert result["conflict"] is False
+
+
+def test_siglip_portrait_wildfire_mismatch():
+    """Portrait photo + wildfire claim scores near zero."""
+    uri = _real_image_uri(_PORTRAIT)
+    result = _siglip_check("a burning forest fire with thick smoke", uri)
+    assert result["siglip_score"] < 0.05
+    assert result["conflict"] is True
 
 
 def test_siglip_model_cached_across_calls():
     """_load_siglip is called only once even for multiple checks (lru_cache)."""
     from fact_check_agent.src.tools.cross_modal_tool import _load_siglip
-    uri = _make_image_uri()
+    uri = _real_image_uri(_GRACE_HOPPER)
     _siglip_check("first call", uri)
-    cache_info_before = _load_siglip.cache_info()
+    before = _load_siglip.cache_info()
     _siglip_check("second call", uri)
-    cache_info_after = _load_siglip.cache_info()
-    assert cache_info_after.hits > cache_info_before.hits
+    after = _load_siglip.cache_info()
+    assert after.hits > before.hits
 
 
 def test_siglip_graceful_fallback_on_bad_image():

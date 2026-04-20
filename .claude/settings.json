@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/shantam/**)",
+      "Bash(.venv/bin/pytest fact_check_agent/tests/test_router.py fact_check_agent/tests/test_data_contracts.py -x -q)",
+      "Bash(.venv/bin/python -m pytest fact_check_agent/tests/test_router.py fact_check_agent/tests/test_data_contracts.py -x -q)",
+      "Bash(.venv/bin/pytest -x -q)",
+      "Bash(PYTHONPATH=/home/shantam/fakenews/memory_agent:/home/shantam/fakenews/fact_check_agent .venv/bin/python -m pytest -p no:launch_testing -p no:launch_testing_ros_pytest_entrypoint -x -q)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

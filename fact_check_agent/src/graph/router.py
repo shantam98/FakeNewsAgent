@@ -1,4 +1,5 @@
 """Routing functions for the LangGraph conditional edges."""
+from fact_check_agent.src.config import settings
 from fact_check_agent.src.models.state import FactCheckState
 
 CACHE_CONFIDENCE_THRESHOLD = 0.80
@@ -19,19 +20,31 @@ def freshness_router(state: FactCheckState) -> str:
         "fresh"  → use cached verdict; skip live search (return_cached → synthesize)
         "stale"  → run live search before synthesizing (live_search → rag_retrieval → synthesize)
     """
-    if state.get("revalidation_needed"):
-        return "stale"
-    return "fresh"
+    if state.get("revalidation_needed") is False:
+        return "fresh"
+    return "stale"  # True or None → stale (safe default)
+
+
+def retrieval_gate_router(state: FactCheckState) -> str:
+    """S2: After retrieval_gate node, route to live_search or skip directly to rag_retrieval.
+
+    Returns:
+        "needed" → proceed to Tavily live search
+        "skip"   → skip Tavily; use memory context only (→ rag_retrieval)
+    """
+    if state.get("retrieval_gate_needed", True):
+        return "needed"
+    return "skip"
 
 
 def debate_check(state: FactCheckState) -> str:
     """Decide whether to trigger multi-agent debate.
 
-    Baseline: always skips debate.
-    SOTA: enable by returning "debate" when 35 < confidence_score < 65.
+    Gated by settings.use_debate. When enabled, routes low-confidence verdicts
+    through an advocate/arbiter debate loop before cross-modal check.
     """
-    # SOTA gate — uncomment to enable multi-agent debate
-    # output = state.get("output")
-    # if output and 35 < output.confidence_score < 65:
-    #     return "debate"
+    if settings.use_debate:
+        output = state.get("output")
+        if output and output.confidence_score < settings.debate_confidence_threshold:
+            return "debate"
     return "skip"

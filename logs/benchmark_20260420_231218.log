@@ -1,0 +1,21 @@
+============================================================
+  Factify2 Benchmark  —  2026-04-20 23:12:18
+============================================================
+  LLM provider  : ollama
+  LLM model     : nemotron-3-nano:4b
+  Embedding     : ollama / nomic-embed-text
+
+  SOTA flags:
+    USE_SIGLIP              = false
+    USE_RETRIEVAL_GATE      = false
+    USE_CLAIM_DECOMPOSITION = false
+    USE_DEBATE              = false
+    USE_FRESHNESS_REACT     = false
+
+  Log file: logs/benchmark_20260420_231218.log
+============================================================
+
+Starting benchmark at 23:12:18...
+
+WARNING fact_check_agent.src.tools.cross_modal_tool: Could not fetch image https://www.digitalmusicnews.com/wp-content/uploads/2016/12/kodakblack2.jpg: HTTP Error 403: Forbidden
+ERROR fact_check_agent.src.tools.cross_modal_tool: Vision cross-modal check failed: Error code: 400 - {'error': {'message': 'image URLs are not currently supported, please use base64 encoded data instead', 'type': 'invalid_request_error', 'param': None, 'code': None}}

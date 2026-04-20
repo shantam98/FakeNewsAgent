@@ -26,7 +26,13 @@ from fact_check_agent.src.models.schemas import (
     SimilarClaim,
 )
 from fact_check_agent.src.models.state import FactCheckState
-from fact_check_agent.src.prompts import VERDICT_SYNTHESIS_PROMPT
+from fact_check_agent.src.prompts import (
+    ADVOCATE_PROMPT,
+    ARBITER_PROMPT,
+    DECOMPOSITION_PROMPT,
+    IS_RETRIEVAL_NEEDED_PROMPT,
+    VERDICT_SYNTHESIS_PROMPT,
+)
 
 if TYPE_CHECKING:
     from src.memory.agent import MemoryAgent  # memory_agent — type hint only
@@ -49,6 +55,7 @@ def receive_claim(state: FactCheckState) -> dict:
         "entity_context":          [],
         "route":                   None,
         "revalidation_needed":     None,
+        "retrieval_gate_needed":   None,
         "retrieved_chunks":        prefetched,
         "sub_claims":              [],
         "debate_transcript":       None,
@@ -299,28 +306,177 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
     return {"output": output}
 
 
-# ── Node: multi_agent_debate (stub — SOTA Task 4) ─────────────────────────────
+# ── Node: decompose_claim (S3) ────────────────────────────────────────────────
+
+def decompose_claim(state: FactCheckState, settings) -> dict:
+    """S3: Split compound claims into atomic sub-claims before retrieval.
+
+    Gated by settings.use_claim_decomposition. No-op in baseline.
+    When enabled, populates state['sub_claims'] for downstream synthesis.
+    """
+    if not settings.use_claim_decomposition:
+        return {}
+
+    inp = state["input"]
+    prompt = DECOMPOSITION_PROMPT.format(claim_text=inp.claim_text)
+    client = _llm_factory.make_llm_client()
+    try:
+        response = client.chat.completions.create(
+            model=_llm_factory.llm_model_name(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        result = json.loads(response.choices[0].message.content)
+        sub_claims = [
+            sc["text"]
+            for sc in result.get("sub_claims", [])
+            if sc.get("verifiable", True)
+        ]
+        logger.info("decompose_claim: %d sub-claims from '%s'", len(sub_claims), inp.claim_text[:60])
+        return {"sub_claims": sub_claims}
+    except Exception as e:
+        logger.error("decompose_claim failed: %s — proceeding with original claim", e)
+        return {}
+
+
+# ── Node: retrieval_gate (S2) ─────────────────────────────────────────────────
+
+def retrieval_gate(state: FactCheckState, settings) -> dict:
+    """S2: Adaptive retrieval gate — skip Tavily when memory context is sufficient.
+
+    Gated by settings.use_retrieval_gate. When disabled, always proceeds to live search.
+    Sets state['retrieval_gate_needed'] which retrieval_gate_router reads.
+    """
+    if not settings.use_retrieval_gate:
+        return {"retrieval_gate_needed": True}
+
+    inp = state["input"]
+    memory_context = ""
+    if state.get("memory_results") and state["memory_results"].results:
+        from fact_check_agent.src.tools.rag_tool import format_rag_context
+        memory_context = format_rag_context(
+            [r.model_dump() for r in state["memory_results"].results]
+        )
+
+    prompt = IS_RETRIEVAL_NEEDED_PROMPT.format(claim_text=inp.claim_text)
+    if memory_context:
+        prompt += f"\n\nEXISTING CONTEXT FROM MEMORY:\n{memory_context}"
+
+    client = _llm_factory.make_llm_client()
+    try:
+        response = client.chat.completions.create(
+            model=_llm_factory.llm_model_name(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        result = json.loads(response.choices[0].message.content)
+        needed = bool(result.get("retrieval_needed", True))
+        logger.info(
+            "retrieval_gate: retrieval_needed=%s reason=%s",
+            needed, result.get("reason", "")
+        )
+        return {"retrieval_gate_needed": needed}
+    except Exception as e:
+        logger.error("retrieval_gate failed: %s — defaulting to retrieval_needed=True", e)
+        return {"retrieval_gate_needed": True}
+
+
+# ── Node: multi_agent_debate (S4) ─────────────────────────────────────────────
 
 def multi_agent_debate(state: FactCheckState, settings) -> dict:
-    """SOTA: Spawn advocate/arbiter agents for ambiguous claims (35 < conf < 65).
+    """S4: Advocate/arbiter debate for low-confidence verdicts.
 
-    Baseline: this node is never reached (debate_check always returns 'skip').
-    Implementation placeholder — wire up when enabling SOTA enhancements.
+    Gated by settings.use_debate + debate_confidence_threshold.
+    Two advocate agents argue for/against, an arbiter synthesises a final verdict.
     """
-    logger.info("multi_agent_debate called (stub — not implemented in baseline)")
-    return {}
+    from fact_check_agent.src.id_utils import make_id
+
+    inp            = state["input"]
+    output         = state.get("output")
+    evidence_block = "\n\n".join(state["retrieved_chunks"]) or "No evidence retrieved."
+
+    client = _llm_factory.make_llm_client()
+
+    def _call(prompt_text: str) -> str:
+        resp = client.chat.completions.create(
+            model=_llm_factory.llm_model_name(),
+            messages=[{"role": "user", "content": prompt_text}],
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content.strip()
+
+    try:
+        for_prompt = ADVOCATE_PROMPT.format(
+            position="TRUE (supported)",
+            position_adj="supporting",
+            claim_text=inp.claim_text,
+            evidence_block=evidence_block,
+        )
+        against_prompt = ADVOCATE_PROMPT.format(
+            position="FALSE (refuted)",
+            position_adj="refuting",
+            claim_text=inp.claim_text,
+            evidence_block=evidence_block,
+        )
+
+        argument_for     = _call(for_prompt)
+        argument_against = _call(against_prompt)
+
+        arbiter_prompt = ARBITER_PROMPT.format(
+            claim_text=inp.claim_text,
+            argument_for=argument_for,
+            argument_against=argument_against,
+        )
+        arbiter_raw = _call(arbiter_prompt)
+
+        # Strip markdown fences if present
+        if arbiter_raw.startswith("```"):
+            arbiter_raw = arbiter_raw.split("```")[1]
+            if arbiter_raw.startswith("json"):
+                arbiter_raw = arbiter_raw[4:]
+        result = json.loads(arbiter_raw)
+
+        transcript = (
+            f"=== FOR (supported) ===\n{argument_for}\n\n"
+            f"=== AGAINST (refuted) ===\n{argument_against}\n\n"
+            f"=== ARBITER ===\n{arbiter_raw}"
+        )
+
+        if output:
+            updated_output = output.model_copy(update={
+                "verdict":          result.get("verdict", output.verdict),
+                "confidence_score": int(result.get("confidence_score", output.confidence_score)),
+                "bias_score":       float(result.get("bias_score", output.bias_score)),
+                "reasoning":        result.get("reasoning", output.reasoning),
+                "evidence_links":   result.get("evidence_links", output.evidence_links),
+            })
+        else:
+            updated_output = output
+
+        logger.info(
+            "multi_agent_debate: verdict=%s confidence=%d",
+            result.get("verdict"), result.get("confidence_score"),
+        )
+        return {"output": updated_output, "debate_transcript": transcript}
+
+    except Exception as e:
+        logger.error("multi_agent_debate failed: %s — keeping original verdict", e)
+        return {}
 
 
 # ── Node: cross_modal_check ───────────────────────────────────────────────────
 
 def cross_modal_check(state: FactCheckState, settings) -> dict:
-    """LLM-based cross-modal consistency check (+ CLIP if ENABLE_CLIP=True)."""
+    """Cross-modal consistency check: SigLIP / Gemma4 vision / LLM caption (priority order)."""
     inp    = state["input"]
     result = check_cross_modal(
         claim_text    = inp.claim_text,
         image_caption = inp.image_caption,
         api_key       = settings.openai_api_key,
         model         = _llm_factory.llm_model_name(),
+        image_url     = getattr(inp, "image_url", None),
     )
 
     current_output: Optional[FactCheckOutput] = state.get("output")
@@ -334,7 +490,7 @@ def cross_modal_check(state: FactCheckState, settings) -> dict:
     return {
         "cross_modal_flag":        result["flag"],
         "cross_modal_explanation": result["explanation"],
-        "clip_similarity_score":   result["clip_score"],
+        "clip_similarity_score":   result.get("siglip_score"),
         "output":                  updated_output or current_output,
     }
 

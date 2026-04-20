@@ -20,6 +20,7 @@ class FactCheckState(TypedDict):
     # ── Routing ───────────────────────────────────────────────────────────────
     route: Optional[str]               # "cache" | "live_search"
     revalidation_needed: Optional[bool]  # set by freshness_check; True → re-run live search
+    retrieval_gate_needed: Optional[bool]  # S2: set by retrieval_gate; False → skip Tavily
 
     # ── Intermediate fact-check data ──────────────────────────────────────────
     retrieved_chunks: list[str]       # live search result + RAG context blocks
@@ -47,6 +48,7 @@ INITIAL_STATE: dict = {
     "entity_context":          [],
     "route":                   None,
     "revalidation_needed":     None,
+    "retrieval_gate_needed":   None,
     "retrieved_chunks":        [],
     "sub_claims":              [],
     "debate_transcript":       None,
