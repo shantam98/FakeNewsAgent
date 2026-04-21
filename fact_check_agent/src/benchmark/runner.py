@@ -357,9 +357,11 @@ def run_benchmark(
     df = load_factify2(split, limit)
     print(f"  {len(df)} records loaded")
 
-    # Pre-generate VLM captions if a vision model is configured and images are enabled
+    # Pre-generate VLM captions if a vision model is configured and images are enabled.
+    # Runs independently of SigLIP — captions feed the synthesis prompt, SigLIP provides
+    # the mismatch flag. Both can be active simultaneously.
     caption_cache: dict = {}
-    if include_image and settings.ollama_vlm_model and not settings.use_siglip:
+    if include_image and settings.ollama_vlm_model:
         print(f"\nPre-generating image captions (VLM: {settings.ollama_vlm_model})...")
         caption_cache = generate_captions_for_df(df, settings.ollama_vlm_model, settings.ollama_base_url)
         print(f"  {sum(1 for v in caption_cache.values() if v)} captions available")
