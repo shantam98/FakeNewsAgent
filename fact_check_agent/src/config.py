@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_llm_model: str = "gemma4:e2b"
     ollama_embedding_model: str = "nomic-embed-text"
+    ollama_vlm_model: str = ""             # vision-language model for caption generation; leave blank to skip
 
     # Retrieval enhancements
     use_graph_rag: bool = False       # enable Neo4j entity-claim traversal in query_memory

@@ -22,6 +22,7 @@ SOTA flags — toggle in .env before running:
     USE_FRESHNESS_REACT=true/false     Freshness ReAct agent (S6)
     LLM_PROVIDER=ollama                Must be 'ollama' for local benchmark
     OLLAMA_LLM_MODEL=gemma4:e2b        Ollama model (or gemma4:12b for better accuracy)
+    OLLAMA_VLM_MODEL=llava:7b          VLM for caption generation (leave blank to skip)
 """
 from __future__ import annotations
 
@@ -85,9 +86,93 @@ def load_factify2(split: str, limit: Optional[int] = None) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+# ── Caption generation (Ollama VLM) ──────────────────────────────────────────
+
+_CAPTION_PROMPT = (
+    "Describe this image in purely objective, factual terms. Focus on: "
+    "people visible (appearance, actions), objects and scene, any text or signs, "
+    "and overall context. Two to four sentences. No interpretation."
+)
+_CAPTION_CACHE_PATH = Path(__file__).resolve().parents[3] / "caption_cache.pkl"
+
+
+def _load_caption_cache() -> dict:
+    if _CAPTION_CACHE_PATH.exists():
+        import pickle
+        with open(_CAPTION_CACHE_PATH, "rb") as f:
+            cache = pickle.load(f)
+        logger.info("Loaded %d cached captions from %s", len(cache), _CAPTION_CACHE_PATH)
+        return cache
+    return {}
+
+
+def _save_caption_cache(cache: dict) -> None:
+    import pickle
+    _CAPTION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_CAPTION_CACHE_PATH, "wb") as f:
+        pickle.dump(cache, f)
+
+
+def generate_captions_for_df(df: pd.DataFrame, vlm_model: str, ollama_base_url: str) -> dict[str, str]:
+    """Generate captions for all unique image URLs in the dataframe using the Ollama VLM.
+
+    Returns a dict mapping image_url → caption. Results are cached to disk so
+    subsequent runs are instant. Skips URLs that fail (403, timeout, etc.).
+    """
+    from openai import OpenAI
+    import base64, urllib.request
+
+    cache = _load_caption_cache()
+    client = OpenAI(base_url=ollama_base_url, api_key="ollama")
+
+    urls = df["claim_image"].dropna().unique().tolist()
+    urls = [u for u in urls if isinstance(u, str) and u.startswith("http") and u not in cache]
+
+    if not urls:
+        logger.info("All captions already cached — skipping VLM generation")
+        return cache
+
+    print(f"  Generating captions for {len(urls)} images using {vlm_model}...")
+    new_count = 0
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                content_type = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                raw = r.read()
+            b64 = base64.b64encode(raw).decode()
+            data_uri = f"data:{content_type};base64,{b64}"
+
+            response = client.chat.completions.create(
+                model=vlm_model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {"type": "text", "text": _CAPTION_PROMPT},
+                    ],
+                }],
+                temperature=0.1,
+                max_tokens=200,
+            )
+            caption = response.choices[0].message.content.strip()
+            cache[url] = caption
+            new_count += 1
+        except Exception as e:
+            logger.warning("Caption skipped for %s: %s", url, e)
+            cache[url] = ""
+
+    if new_count:
+        _save_caption_cache(cache)
+        print(f"  {new_count} new captions generated and cached")
+
+    return cache
+
+
 # ── Input builder ─────────────────────────────────────────────────────────────
 
-def build_fact_check_input(row: pd.Series, include_image: bool = True):
+def build_fact_check_input(row: pd.Series, include_image: bool = True,
+                           caption_cache: Optional[dict] = None):
     """Convert one Factify2 row to a FactCheckInput.
 
     Option A: inject document text as prefetched_chunks → skips live_search.
@@ -120,14 +205,19 @@ def build_fact_check_input(row: pd.Series, include_image: bool = True):
         parsed = urlparse(image_url)
         source_url = f"{parsed.scheme}://{parsed.netloc}/"
 
+    image_caption = None
+    if include_image and image_url and caption_cache:
+        image_caption = caption_cache.get(image_url) or None
+
     return FactCheckInput(
-        claim_id     = make_id(f"factify2_{row_idx}_"),
-        claim_text   = claim_text,
-        entities     = [],
-        source_url   = source_url,
-        article_id   = f"factify2_{row_idx}",
-        image_url    = image_url if include_image else None,
-        timestamp    = datetime.now(timezone.utc),
+        claim_id      = make_id(f"factify2_{row_idx}_"),
+        claim_text    = claim_text,
+        entities      = [],
+        source_url    = source_url,
+        article_id    = f"factify2_{row_idx}",
+        image_url     = image_url if include_image else None,
+        image_caption = image_caption,
+        timestamp     = datetime.now(timezone.utc),
         prefetched_chunks = [evidence_chunk],
     )
 
@@ -262,6 +352,13 @@ def run_benchmark(
     df = load_factify2(split, limit)
     print(f"  {len(df)} records loaded")
 
+    # Pre-generate VLM captions if a vision model is configured and images are enabled
+    caption_cache: dict = {}
+    if include_image and settings.ollama_vlm_model and not settings.use_siglip:
+        print(f"\nPre-generating image captions (VLM: {settings.ollama_vlm_model})...")
+        caption_cache = generate_captions_for_df(df, settings.ollama_vlm_model, settings.ollama_base_url)
+        print(f"  {sum(1 for v in caption_cache.values() if v)} captions available")
+
     print("Connecting to MemoryAgent...")
     try:
         memory = get_memory()
@@ -291,7 +388,8 @@ def run_benchmark(
         true_verdict   = VERDICT_MAP.get(true_label_raw, "misleading")
 
         try:
-            fact_input = build_fact_check_input(row, include_image=include_image)
+            fact_input = build_fact_check_input(row, include_image=include_image,
+                                                caption_cache=caption_cache)
             claim_num = len(results) + 1
             print(f"\n── Claim {claim_num}/{len(df)}  [{true_label_raw}] ──────────────────────────────")
             print(f"   {fact_input.claim_text[:100]}{'…' if len(fact_input.claim_text) > 100 else ''}")
