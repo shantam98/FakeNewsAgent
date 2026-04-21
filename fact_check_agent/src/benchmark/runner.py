@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
@@ -403,7 +404,7 @@ def run_benchmark(
 
     print(f"Running benchmark ({len(df)} records)...\n")
 
-    for i, row in df.iterrows():
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Claims", unit="claim"):
         true_label_raw = str(row.get("Category", "")).strip()
         true_verdict   = VERDICT_MAP.get(true_label_raw, "misleading")
 
