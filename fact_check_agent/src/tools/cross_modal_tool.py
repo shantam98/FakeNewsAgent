@@ -178,8 +178,8 @@ def _vision_check(claim_text: str, image_url: str) -> Optional[dict]:
                 raw = raw[4:]
         return json.loads(raw)
     except Exception as e:
-        logger.error("Vision cross-modal check failed: %s", e)
-        return {"conflict": False, "explanation": None}
+        logger.warning("Vision cross-modal check failed (%s) — falling back to caption mode", e)
+        return None
 
 
 def _llm_check(claim_text: str, image_caption: str, api_key: str, model: str) -> dict:
