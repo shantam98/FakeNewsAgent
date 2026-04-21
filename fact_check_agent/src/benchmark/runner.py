@@ -11,6 +11,8 @@ Usage:
     --limit      max records to evaluate     (default: 200)
     --out        output CSV path             (default: results/benchmark_<timestamp>.csv)
     --no-image   disable image_url field     (default: images enabled)
+    --dry-run    skip all DB writes          (default: writes enabled)
+    --offline    skip all DB reads+writes    (no Docker needed)
 
 SOTA flags — toggle in .env before running:
     USE_SIGLIP=true/false              SigLIP image-text similarity (local, no Ollama needed)
@@ -384,7 +386,17 @@ def main():
                         help="Output CSV path (default: results/benchmark_<timestamp>.csv)")
     parser.add_argument("--no-image", action="store_true",
                         help="Disable image_url field (text-only mode)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Skip all DB writes (ChromaDB + Neo4j) — benchmark only")
+    parser.add_argument("--offline", action="store_true",
+                        help="Skip all DB reads+writes — no Docker needed, implies --dry-run")
     args = parser.parse_args()
+
+    if args.offline:
+        os.environ["OFFLINE_MODE"] = "true"
+        os.environ["DRY_RUN"] = "true"
+    elif args.dry_run:
+        os.environ["DRY_RUN"] = "true"
 
     limit = args.limit if args.limit > 0 else None
     run_benchmark(

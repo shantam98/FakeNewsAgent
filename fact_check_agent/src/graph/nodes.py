@@ -76,6 +76,15 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent", settings=None) ->
     if settings is None:
         settings = _settings
 
+    if settings.offline_mode:
+        logger.info("query_memory: offline_mode=True — skipping all DB reads")
+        return {
+            "memory_results":  MemoryQueryResponse(results=[], max_confidence=0.0),
+            "entity_context":  [],
+            "source_credibility": {},
+            "last_verified_at": None,
+        }
+
     inp = state["input"]
 
     # ── Stage 1: vector similarity search ────────────────────────────────
@@ -499,6 +508,12 @@ def cross_modal_check(state: FactCheckState, settings) -> dict:
 
 def write_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
     """Write the final verdict back to MemoryAgent (ChromaDB + Neo4j)."""
+    from fact_check_agent.src.config import settings as _settings
+    if _settings.dry_run or _settings.offline_mode:
+        logger.info("write_memory: %s — skipping DB write",
+                    "offline_mode" if _settings.offline_mode else "dry_run")
+        return {}
+
     from src.models.verdict import Verdict  # memory_agent model — path set by bootstrap
 
     output: Optional[FactCheckOutput] = state.get("output")

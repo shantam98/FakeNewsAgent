@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # S6 — Freshness ReAct Agent
     use_freshness_react: bool = False      # replace single LLM call with tool-calling ReAct loop
 
+    # Benchmark / evaluation
+    dry_run: bool = False                  # skip all DB writes (ChromaDB + Neo4j) during benchmark runs
+    offline_mode: bool = False             # skip all DB reads+writes — implies dry_run; no Docker needed
+
     # LangSmith tracing
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
