@@ -10,6 +10,7 @@ Usage:
     output = state["output"]
 """
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from langgraph.graph import END, StateGraph
@@ -42,6 +43,46 @@ if TYPE_CHECKING:
     from src.memory.agent import MemoryAgent
 
 logger = logging.getLogger(__name__)
+pipeline_logger = logging.getLogger("pipeline")
+
+
+def _timed(name: str, fn):
+    """Wrap a node function with entry/exit logging and ms-level timing."""
+    def wrapper(state):
+        claim_id = state.get("input", {}).claim_id if hasattr(state.get("input", {}), "claim_id") else "?"
+        pipeline_logger.info("  ┌─ %-22s [%s]", name, claim_id)
+        t0 = time.perf_counter()
+        result = fn(state)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        # Extract the most useful field from the result for the log line
+        note = ""
+        if result:
+            if "output" in result and result["output"]:
+                o = result["output"]
+                note = f"verdict={o.verdict} conf={o.confidence_score}"
+            elif "memory_results" in result and result["memory_results"]:
+                mr = result["memory_results"]
+                note = f"max_conf={mr.max_confidence:.2f} n={len(mr.results)}"
+            elif "route" in result and result["route"]:
+                note = f"route={result['route']}"
+            elif "revalidation_needed" in result:
+                note = f"revalidate={result['revalidation_needed']}"
+            elif "retrieval_gate_needed" in result:
+                note = f"gate={'pass' if result['retrieval_gate_needed'] else 'skip'}"
+            elif "cross_modal_flag" in result:
+                score = result.get("clip_similarity_score")
+                score_str = f" siglip={score:.3f}" if score is not None else ""
+                note = f"flag={result['cross_modal_flag']}{score_str}"
+            elif "sub_claims" in result and result["sub_claims"]:
+                note = f"sub_claims={len(result['sub_claims'])}"
+            elif "retrieved_chunks" in result:
+                note = f"chunks={len(result['retrieved_chunks'])}"
+
+        pipeline_logger.info("  └─ %-22s %5.0fms  %s", name, elapsed_ms, note)
+        return result
+    wrapper.__name__ = name
+    return wrapper
 
 
 def build_graph(memory: "MemoryAgent"):
@@ -54,33 +95,37 @@ def build_graph(memory: "MemoryAgent"):
     Returns:
         A compiled LangGraph StateGraph.
     """
-    # Bind memory and settings into nodes that need them via closures
-    def _query_memory(state):       return query_memory(state, memory, settings)
-    def _decompose_claim(state):    return decompose_claim(state, settings)
-    def _retrieval_gate(state):     return retrieval_gate(state, settings)
-    def _freshness_check(state):    return freshness_check(state, settings)
-    def _live_search(state):        return live_search(state, settings)
-    def _synthesize_verdict(state): return synthesize_verdict(state, settings)
-    def _multi_agent_debate(state): return multi_agent_debate(state, settings)
-    def _cross_modal_check(state):  return cross_modal_check(state, settings)
-    def _write_memory(state):       return write_memory(state, memory)
+    # Bind memory and settings into nodes, then wrap with timing logger
+    _query_memory       = _timed("query_memory",       lambda s: query_memory(s, memory, settings))
+    _decompose_claim    = _timed("decompose_claim",    lambda s: decompose_claim(s, settings))
+    _retrieval_gate     = _timed("retrieval_gate",     lambda s: retrieval_gate(s, settings))
+    _freshness_check    = _timed("freshness_check",    lambda s: freshness_check(s, settings))
+    _live_search        = _timed("live_search",        lambda s: live_search(s, settings))
+    _synthesize_verdict = _timed("synthesize_verdict", lambda s: synthesize_verdict(s, settings))
+    _multi_agent_debate = _timed("multi_agent_debate", lambda s: multi_agent_debate(s, settings))
+    _cross_modal_check  = _timed("cross_modal_check",  lambda s: cross_modal_check(s, settings))
+    _write_memory       = _timed("write_memory",       lambda s: write_memory(s, memory))
+    _receive_claim      = _timed("receive_claim",      receive_claim)
+    _return_cached      = _timed("return_cached",      return_cached)
+    _rag_retrieval      = _timed("rag_retrieval",      rag_retrieval)
+    _emit_output        = _timed("emit_output",        emit_output)
 
     g = StateGraph(FactCheckState)
 
     # ── Register nodes ────────────────────────────────────────────────────────
-    g.add_node("receive_claim",      receive_claim)
-    g.add_node("decompose_claim",    _decompose_claim)   # S3
+    g.add_node("receive_claim",      _receive_claim)
+    g.add_node("decompose_claim",    _decompose_claim)
     g.add_node("query_memory",       _query_memory)
-    g.add_node("retrieval_gate",     _retrieval_gate)    # S2
+    g.add_node("retrieval_gate",     _retrieval_gate)
     g.add_node("freshness_check",    _freshness_check)
-    g.add_node("return_cached",      return_cached)
+    g.add_node("return_cached",      _return_cached)
     g.add_node("live_search",        _live_search)
-    g.add_node("rag_retrieval",      rag_retrieval)
+    g.add_node("rag_retrieval",      _rag_retrieval)
     g.add_node("synthesize_verdict", _synthesize_verdict)
-    g.add_node("multi_agent_debate", _multi_agent_debate)  # S4
+    g.add_node("multi_agent_debate", _multi_agent_debate)
     g.add_node("cross_modal_check",  _cross_modal_check)
     g.add_node("write_memory",       _write_memory)
-    g.add_node("emit_output",        emit_output)
+    g.add_node("emit_output",        _emit_output)
 
     # ── Wire edges ────────────────────────────────────────────────────────────
     g.set_entry_point("receive_claim")

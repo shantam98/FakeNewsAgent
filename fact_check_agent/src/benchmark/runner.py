@@ -37,8 +37,15 @@ from typing import Optional
 import pandas as pd
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)  # suppress property-key warnings on empty graph
-logging.getLogger("langfuse").setLevel(logging.ERROR)             # suppress tracing errors when server is offline
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+logging.getLogger("langfuse").setLevel(logging.ERROR)
+# Show per-node pipeline trace at INFO level with a clean format
+_pipeline_handler = logging.StreamHandler()
+_pipeline_handler.setFormatter(logging.Formatter("%(message)s"))
+_pipeline_log = logging.getLogger("pipeline")
+_pipeline_log.setLevel(logging.INFO)
+_pipeline_log.addHandler(_pipeline_handler)
+_pipeline_log.propagate = False
 logger = logging.getLogger(__name__)
 
 # ── Label mapping ─────────────────────────────────────────────────────────────
@@ -283,16 +290,23 @@ def run_benchmark(
 
         try:
             fact_input = build_fact_check_input(row, include_image=include_image)
+            claim_num = len(results) + 1
+            print(f"\n── Claim {claim_num}/{len(df)}  [{true_label_raw}] ──────────────────────────────")
+            print(f"   {fact_input.claim_text[:100]}{'…' if len(fact_input.claim_text) > 100 else ''}")
 
+            t_claim = time.time()
             state = graph.invoke({"input": fact_input})
             output = state.get("output")
 
+            claim_elapsed = time.time() - t_claim
             pred_verdict    = output.verdict          if output else None
             confidence      = output.confidence_score if output else None
             cross_modal_flag= output.cross_modal_flag if output else False
             cross_modal_exp = output.cross_modal_explanation if output else None
             reasoning       = output.reasoning        if output else ""
             bias_score      = output.bias_score       if output else None
+            correct_mark = "✓" if pred_verdict == true_verdict else "✗"
+            print(f"   {correct_mark} pred={pred_verdict}  true={true_verdict}  conf={confidence}  {claim_elapsed:.1f}s")
 
         except Exception as e:
             logger.error("Record %d failed: %s", i, e)
