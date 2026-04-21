@@ -26,12 +26,17 @@ SOTA flags — toggle in .env before running:
 """
 from __future__ import annotations
 
+import os
+import sys
+
+# Disable langfuse before any other imports — it initialises at import time
+# and will spam 404 warnings if the local server isn't running.
+os.environ["LANGFUSE_ENABLED"] = "false"
+
 import argparse
 import csv
 import json
 import logging
-import os
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +46,7 @@ import pandas as pd
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
-logging.getLogger("langfuse").setLevel(logging.ERROR)
+logging.getLogger("langfuse").setLevel(logging.CRITICAL)
 # Show per-node pipeline trace at INFO level with a clean format
 _pipeline_handler = logging.StreamHandler()
 _pipeline_handler.setFormatter(logging.Formatter("%(message)s"))
