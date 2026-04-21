@@ -10,10 +10,11 @@ openai>=2.26
 # Search
 tavily-python>=0.3
 
-# Cross-modal CLIP (SOTA — not used in baseline, ready to enable)
+# Cross-modal SigLIP (SOTA — not used in baseline, ready to enable)
 transformers>=4.40
 torch>=2.2
 Pillow>=10.0
+sentencepiece>=0.1.99
 
 # Data / Config
 pydantic>=2.7

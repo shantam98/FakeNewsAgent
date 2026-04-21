@@ -48,7 +48,8 @@ def _decode_image(image_url: str):
         return PILImage.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
     import urllib.request
-    with urllib.request.urlopen(image_url, timeout=10) as r:
+    req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
         return PILImage.open(io.BytesIO(r.read())).convert("RGB")
 
 
@@ -62,7 +63,11 @@ def _siglip_check(claim_text: str, image_url: str) -> dict:
 
     try:
         processor, model = _load_siglip(settings.siglip_model)
-        image = _decode_image(image_url)
+        try:
+            image = _decode_image(image_url)
+        except Exception as fetch_err:
+            logger.warning("SigLIP: could not fetch image %s: %s — skipping", image_url, fetch_err)
+            return {"conflict": False, "explanation": None, "siglip_score": None}
 
         inputs = processor(
             text=[claim_text],
