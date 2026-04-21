@@ -297,10 +297,23 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
             "evidence_links": [],
         }
 
+    # Normalise verdict to the 3 valid labels — model sometimes outputs variants
+    _VALID_LABELS = {"supported", "refuted", "misleading"}
+    raw_verdict = str(result.get("verdict", "misleading")).lower().strip()
+    if raw_verdict not in _VALID_LABELS:
+        # Map common variants
+        if "support" in raw_verdict:
+            raw_verdict = "supported"
+        elif "refut" in raw_verdict or "contradict" in raw_verdict or "false" in raw_verdict:
+            raw_verdict = "refuted"
+        else:
+            raw_verdict = "misleading"
+        logger.warning("synthesize_verdict: non-standard label normalised to '%s'", raw_verdict)
+
     output = FactCheckOutput(
         verdict_id      = make_id("vrd_"),
         claim_id        = inp.claim_id,
-        verdict         = result.get("verdict", "misleading"),
+        verdict         = raw_verdict,
         confidence_score= int(result.get("confidence_score", 0)),
         evidence_links  = result.get("evidence_links", []),
         reasoning       = result.get("reasoning", ""),

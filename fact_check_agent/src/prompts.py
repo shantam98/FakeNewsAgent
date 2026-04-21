@@ -5,10 +5,10 @@ without touching agent logic. Each prompt has a version comment — bump it
 whenever the structure changes and re-run benchmarks.
 """
 
-# ── v1.0 ─────────────────────────────────────────────────────────────────────
+# ── v1.1 ─────────────────────────────────────────────────────────────────────
 
 VERDICT_SYNTHESIS_PROMPT = """\
-Think step by step before concluding.
+You are a fact-checker. Analyse the claim against the provided evidence and return a verdict.
 
 CLAIM: {claim_text}
 
@@ -22,16 +22,20 @@ The source credibility score reflects how often this source's past claims (on si
 have been verified as true. A low score does not make the current claim false — weigh it
 alongside the evidence. High bias std means the source is inconsistent across topics.
 
-Based on the evidence above, answer the following:
-1. Is the claim SUPPORTED, REFUTED, or MISLEADING?
-   - SUPPORTED: evidence clearly backs the claim
-   - REFUTED: evidence clearly contradicts the claim
-   - MISLEADING: claim is partially true, taken out of context, or exaggerated
-2. Confidence score (0–100): how certain are you given the available evidence?
-   Lower this score if source credibility is low and evidence is thin.
-3. Bias score (0.0–1.0): how much political, ideological, or emotional bias does this claim carry?
-4. Reasoning: summarise your chain of thought in 2–3 sentences. Mention source credibility
-   only if it materially influenced your verdict.
+VERDICT LABELS — you MUST choose exactly one:
+- "supported"  : The evidence directly and clearly confirms the claim is true.
+- "refuted"    : The evidence directly and clearly contradicts or disproves the claim.
+- "misleading" : Use this in ALL other cases, including:
+                   • The evidence is insufficient, ambiguous, or only partially addresses the claim
+                   • The claim is exaggerated, taken out of context, or missing key caveats
+                   • The provided document does not contain enough information to confirm or deny
+
+IMPORTANT RULES:
+- You MUST output exactly one of the three strings: supported, refuted, misleading
+- Do NOT output "not supported", "unverified", "not enough information", or any other label
+- When in doubt, choose "misleading" — it is the correct label for uncertain or partial evidence
+- Only choose "supported" or "refuted" when the evidence is direct, explicit, and unambiguous
+- Confidence score: use 50–70 when evidence is partial; only use >80 when evidence is clear and direct
 
 Return a JSON object with exactly these keys:
 {{
@@ -184,6 +188,9 @@ ARGUMENT FOR SUPPORTED:
 
 ARGUMENT FOR REFUTED:
 {argument_against}
+
+You MUST choose exactly one verdict: "supported", "refuted", or "misleading".
+Do NOT use any other label. If neither argument is convincing, choose "misleading".
 
 Return JSON with the same structure as the verdict synthesis prompt:
 {{
