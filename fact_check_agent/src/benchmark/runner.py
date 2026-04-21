@@ -159,8 +159,7 @@ def generate_captions_for_df(df: pd.DataFrame, vlm_model: str, ollama_base_url: 
             cache[url] = caption
             new_count += 1
         except Exception as e:
-            logger.warning("Caption skipped for %s: %s", url, e)
-            cache[url] = ""
+            print(f"  ✗ caption failed ({url[:60]}...): {e}")
 
     if new_count:
         _save_caption_cache(cache)
@@ -322,12 +321,13 @@ def run_benchmark(
 
     # Must set env before importing settings
     for key, default in [
-        ("LLM_PROVIDER",     "ollama"),
-        ("EMBEDDING_PROVIDER","ollama"),
-        ("OPENAI_API_KEY",    "unused"),
-        ("NEO4J_URI",         "bolt://localhost:7687"),
-        ("NEO4J_PASSWORD",    "fakenews123"),
-        ("CHROMA_HOST",       "localhost"),
+        ("LLM_PROVIDER",      "ollama"),
+        ("EMBEDDING_PROVIDER", "ollama"),
+        ("OPENAI_API_KEY",     "unused"),
+        ("NEO4J_URI",          "bolt://localhost:7687"),
+        ("NEO4J_PASSWORD",     "fakenews123"),
+        ("CHROMA_HOST",        "localhost"),
+        ("LANGFUSE_ENABLED",   "false"),   # disable langfuse tracing — prevents 404 spam
     ]:
         os.environ.setdefault(key, default)
 
@@ -359,11 +359,8 @@ def run_benchmark(
         caption_cache = generate_captions_for_df(df, settings.ollama_vlm_model, settings.ollama_base_url)
         print(f"  {sum(1 for v in caption_cache.values() if v)} captions available")
 
-    print("Connecting to MemoryAgent...")
-    try:
-        memory = get_memory()
-    except Exception as e:
-        print(f"  WARNING: MemoryAgent unavailable ({e}). Running without memory (no cache path).")
+    if settings.offline_mode:
+        print("Offline mode — skipping MemoryAgent connection")
         from unittest.mock import MagicMock
         memory = MagicMock()
         memory.search_similar_claims.return_value = {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
@@ -374,6 +371,22 @@ def run_benchmark(
         memory.add_verdict.return_value = None
         memory.query_source_credibility.return_value = {"distances": [[]], "metadatas": [[]]}
         memory.add_source_credibility_point.return_value = None
+    else:
+        print("Connecting to MemoryAgent...")
+        try:
+            memory = get_memory()
+        except Exception as e:
+            print(f"  WARNING: MemoryAgent unavailable ({e}). Running without memory (no cache path).")
+            from unittest.mock import MagicMock
+            memory = MagicMock()
+            memory.search_similar_claims.return_value = {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
+            memory.get_entity_context.return_value = []
+            memory.get_entity_ids_for_claims.return_value = []
+            memory.get_graph_claims_for_entities.return_value = []
+            memory.get_verdict_by_claim.return_value = {"ids": [], "metadatas": []}
+            memory.add_verdict.return_value = None
+            memory.query_source_credibility.return_value = {"distances": [[]], "metadatas": [[]]}
+            memory.add_source_credibility_point.return_value = None
 
     graph = build_graph(memory)
 
