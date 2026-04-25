@@ -15,10 +15,10 @@ from fact_check_agent.src.agents.reflection_agent import (
     query_source_credibility,
     update_source_credibility,
 )
+from fact_check_agent.src.agents import context_claim_agent
 from fact_check_agent.src.tools.cross_modal_tool import check_cross_modal
 from fact_check_agent.src.tools.freshness_tool import check_freshness
-from fact_check_agent.src.tools.live_search_tool import format_search_context, search_live
-from fact_check_agent.src.tools.rag_tool import format_rag_context, retrieve_similar_claims
+from fact_check_agent.src.tools.rag_tool import retrieve_similar_claims
 from fact_check_agent.src.tools.reranker import rerank_candidates
 from fact_check_agent.src.models.schemas import (
     FactCheckOutput,
@@ -29,8 +29,6 @@ from fact_check_agent.src.models.state import FactCheckState
 from fact_check_agent.src.prompts import (
     ADVOCATE_PROMPT,
     ARBITER_PROMPT,
-    DECOMPOSITION_PROMPT,
-    IS_RETRIEVAL_NEEDED_PROMPT,
     VERDICT_SYNTHESIS_PROMPT,
 )
 
@@ -43,27 +41,23 @@ logger = logging.getLogger(__name__)
 # ── Node: receive_claim ───────────────────────────────────────────────────────
 
 def receive_claim(state: FactCheckState) -> dict:
-    """Initialise all mutable state fields to defaults.
-
-    FactCheckInput is already complete when graph.invoke() is called.
-    This node does not fetch or transform data — it just resets state fields
-    so downstream nodes can safely read them without KeyError.
-    """
-    prefetched = list(state["input"].prefetched_chunks)
+    """Initialise all mutable state fields; seed sub_claims from pre-decomposed queries."""
+    inp        = state["input"]
+    prefetched = list(inp.prefetched_chunks)
+    sub_claims = list(inp.queries)   # pre-decomposed by preprocessing; [] in single-claim mode
     return {
         "memory_results":          None,
         "entity_context":          [],
-        "route":                   None,
-        "revalidation_needed":     None,
-        "retrieval_gate_needed":   None,
+        "fresh_context":           [],
+        "stale_context":           [],
+        "context_claims":          [],
         "retrieved_chunks":        prefetched,
-        "sub_claims":              [],
+        "sub_claims":              sub_claims,
         "debate_transcript":       None,
         "source_credibility":      None,
         "cross_modal_flag":        False,
         "cross_modal_explanation": None,
         "clip_similarity_score":   None,
-        "last_verified_at":        None,
         "output":                  None,
     }
 
@@ -82,7 +76,6 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent", settings=None) ->
             "memory_results":  MemoryQueryResponse(results=[], max_confidence=0.0),
             "entity_context":  [],
             "source_credibility": {},
-            "last_verified_at": None,
         }
 
     inp = state["input"]
@@ -127,9 +120,6 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent", settings=None) ->
         default=0.0,
     )
 
-    best = next((r for r in results if r.verdict_confidence == max_confidence and r.verified_at), None)
-    last_verified_at = best.verified_at if best else None
-
     source_cred = query_source_credibility(
         claim_text = inp.claim_text,
         source_url = inp.source_url,
@@ -147,102 +137,117 @@ def query_memory(state: FactCheckState, memory: "MemoryAgent", settings=None) ->
     return {
         "memory_results":     MemoryQueryResponse(results=results, max_confidence=max_confidence),
         "entity_context":     entity_ctx,
-        "last_verified_at":   last_verified_at,
         "source_credibility": source_cred,
     }
 
 
-# ── Node: return_cached ───────────────────────────────────────────────────────
+# ── Node: freshness_check_all ─────────────────────────────────────────────────
 
-def return_cached(state: FactCheckState) -> dict:
-    """Cache-hit path: note the cached claim for context; synthesis still runs."""
-    best = next(
-        (r for r in state["memory_results"].results if r.verdict_label),
-        None,
-    )
-    chunk = (
-        f"[CACHE HIT] Similar verified claim: \"{best.claim_text}\" "
-        f"— Prior verdict: {best.verdict_label} "
-        f"({best.verdict_confidence:.0%} confidence)"
-        if best else "[CACHE HIT] Prior verdict found but no claim text available."
-    )
-    logger.info("Cache hit path triggered")
-    return {"retrieved_chunks": [chunk], "route": "cache"}
+def freshness_check_all(state: FactCheckState, settings) -> dict:
+    """Tag every retrieved SimilarClaim as fresh or stale using check_freshness().
 
-
-# ── Node: freshness_check ────────────────────────────────────────────────────
-
-def freshness_check(state: FactCheckState, settings) -> dict:
-    """LLM-based classifier: should the cached verdict be re-verified via live search?
-
-    Only runs on the cache path (confidence >= CACHE_CONFIDENCE_THRESHOLD).
-    If last_verified_at is unavailable, defaults to revalidate=True (safe fallback).
-    Result is stored in state so the freshness_router can route accordingly.
+    Claims without a verified_at timestamp default to stale (safe assumption).
+    Claims without a verdict_label are also marked stale — no verdict to reuse.
     """
-    last_verified_at = state.get("last_verified_at")
-    if not last_verified_at:
-        logger.info("freshness_check: no verified_at timestamp — defaulting to revalidate")
-        return {"revalidation_needed": True}
+    results = []
+    if state.get("memory_results") and state["memory_results"].results:
+        results = state["memory_results"].results
 
-    memory_results = state["memory_results"]
-    best = next(
-        (r for r in memory_results.results if r.verdict_label and r.verified_at),
-        None,
+    if settings.offline_mode or not results:
+        return {"fresh_context": [], "stale_context": []}
+
+    fresh: list[dict] = []
+    stale: list[dict] = []
+
+    for claim in results:
+        chunk = claim.model_dump()
+
+        if not claim.verified_at or not claim.verdict_label:
+            stale.append(chunk)
+            continue
+
+        freshness = check_freshness(
+            claim_text         = claim.claim_text,
+            verdict_label      = claim.verdict_label,
+            verdict_confidence = claim.verdict_confidence or 0.5,
+            last_verified_at   = claim.verified_at,
+            api_key            = settings.openai_api_key,
+            model              = _llm_factory.llm_model_name(),
+        )
+        chunk["freshness_reason"]   = freshness["reason"]
+        chunk["freshness_category"] = freshness["claim_category"]
+
+        if freshness["revalidate"]:
+            stale.append(chunk)
+        else:
+            fresh.append(chunk)
+
+    logger.info("freshness_check_all: %d fresh, %d stale", len(fresh), len(stale))
+    return {"fresh_context": fresh, "stale_context": stale}
+
+
+# ── Node: context_claim_agent ─────────────────────────────────────────────────
+
+def context_claim_agent_node(state: FactCheckState, settings) -> dict:
+    """Generate factual/counter-factual questions, check coverage, search gaps, compose claims."""
+    pre_queries = state.get("sub_claims") or []
+    claims = context_claim_agent.run(
+        claim_text        = state["input"].claim_text,
+        fresh_context     = state.get("fresh_context", []),
+        prefetched_chunks = state.get("retrieved_chunks", []),
+        tavily_api_key    = settings.tavily_api_key,
+        pre_queries       = pre_queries or None,
     )
-    if not best:
-        return {"revalidation_needed": True}
-
-    result = check_freshness(
-        claim_text         = state["input"].claim_text,
-        verdict_label      = best.verdict_label,
-        verdict_confidence = best.verdict_confidence or 0.0,
-        last_verified_at   = last_verified_at,
-        api_key            = settings.openai_api_key,
-        model              = _llm_factory.llm_model_name(),
-    )
-    return {"revalidation_needed": result["revalidate"]}
-
-
-# ── Node: live_search ─────────────────────────────────────────────────────────
-
-def live_search(state: FactCheckState, settings) -> dict:
-    """Live path: search Tavily for current evidence.
-
-    Skips the Tavily call when prefetched_chunks were provided (e.g. Factify2 Option A eval).
-    """
-    if state.get("retrieved_chunks"):
-        logger.info("live_search: skipping Tavily — using %d pre-fetched chunks", len(state["retrieved_chunks"]))
-        return {"route": "live_search"}
-    results          = search_live(state["input"].claim_text, api_key=settings.tavily_api_key)
-    context, _links  = format_search_context(results)
-    logger.info("live_search: %d results", len(results))
-    return {"retrieved_chunks": [context], "route": "live_search"}
-
-
-# ── Node: rag_retrieval ───────────────────────────────────────────────────────
-
-def rag_retrieval(state: FactCheckState) -> dict:
-    """Augment live search chunks with RAG context from memory results."""
-    rag_context = format_rag_context(
-        [r.model_dump() for r in state["memory_results"].results]
-    )
-    return {"retrieved_chunks": list(state["retrieved_chunks"]) + [rag_context]}
+    return {"context_claims": claims}
 
 
 # ── Node: synthesize_verdict ──────────────────────────────────────────────────
 
+def _format_context_claims(context_claims: list[dict]) -> str:
+    """Render context_claims as a structured text block for the synthesis prompt."""
+    factual = [c for c in context_claims if c["type"] == "factual"]
+    counter = [c for c in context_claims if c["type"] == "counter_factual"]
+    memory  = [c for c in context_claims if c["type"] == "memory"]
+
+    lines: list[str] = []
+
+    if factual:
+        lines.append("[FACTUAL EVIDENCE] — supports claim being true")
+        for c in factual:
+            lines.append(f"• Q: {c['question']}")
+            lines.append(f"  ↳ {c['content']} [{c['source']}]")
+
+    if counter:
+        lines.append("")
+        lines.append("[COUNTER-FACTUAL EVIDENCE] — challenges claim being true")
+        for c in counter:
+            lines.append(f"• Q: {c['question']}")
+            lines.append(f"  ↳ {c['content']} [{c['source']}]")
+
+    if memory:
+        lines.append("")
+        lines.append("[MEMORY CONTEXT] — prior verified claims (fresh)")
+        for c in memory:
+            verdict_str = ""
+            if c.get("verdict"):
+                conf = f" ({c['confidence']:.0%} confidence)" if c.get("confidence") else ""
+                verdict_str = f" → {c['verdict']}{conf}"
+            lines.append(f"• \"{c['content']}\"{verdict_str} [memory]")
+
+    return "\n".join(lines) if lines else "No evidence available."
+
+
 def synthesize_verdict(state: FactCheckState, settings) -> dict:
-    """Call gpt-4o to synthesise a verdict from all retrieved evidence."""
+    """Synthesise a credibility-weighted verdict from structured context claims."""
     from fact_check_agent.src.id_utils import make_id
 
-    inp            = state["input"]
-    evidence_block = "\n\n".join(state["retrieved_chunks"]) or "No evidence retrieved."
+    inp                  = state["input"]
+    context_claims       = state.get("context_claims") or []
+    context_claims_block = _format_context_claims(context_claims)
 
     # Build source credibility note
-    cred_lines = [f"Source: {inp.source_url}"]
-
-    # Topic-conditioned source credibility from Reflection Agent
-    sc = state.get("source_credibility") or {}
+    cred_lines   = [f"Source: {inp.source_url}"]
+    sc           = state.get("source_credibility") or {}
     cred_mean    = sc.get("credibility_mean")
     bias_mean    = sc.get("bias_mean")
     bias_std     = sc.get("bias_std")
@@ -274,7 +279,7 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
 
     prompt = VERDICT_SYNTHESIS_PROMPT.format(
         claim_text=inp.claim_text,
-        evidence_block=evidence_block,
+        context_claims_block=context_claims_block,
         source_credibility_note=source_credibility_note,
     )
 
@@ -328,83 +333,6 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
     return {"output": output}
 
 
-# ── Node: decompose_claim (S3) ────────────────────────────────────────────────
-
-def decompose_claim(state: FactCheckState, settings) -> dict:
-    """S3: Split compound claims into atomic sub-claims before retrieval.
-
-    Gated by settings.use_claim_decomposition. No-op in baseline.
-    When enabled, populates state['sub_claims'] for downstream synthesis.
-    """
-    if not settings.use_claim_decomposition:
-        return {}
-
-    inp = state["input"]
-    prompt = DECOMPOSITION_PROMPT.format(claim_text=inp.claim_text)
-    client = _llm_factory.make_llm_client()
-    try:
-        response = client.chat.completions.create(
-            model=_llm_factory.llm_model_name(),
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-        result = json.loads(response.choices[0].message.content)
-        sub_claims = [
-            sc["text"]
-            for sc in result.get("sub_claims", [])
-            if sc.get("verifiable", True)
-        ]
-        logger.info("decompose_claim: %d sub-claims from '%s'", len(sub_claims), inp.claim_text[:60])
-        return {"sub_claims": sub_claims}
-    except Exception as e:
-        logger.error("decompose_claim failed: %s — proceeding with original claim", e)
-        return {}
-
-
-# ── Node: retrieval_gate (S2) ─────────────────────────────────────────────────
-
-def retrieval_gate(state: FactCheckState, settings) -> dict:
-    """S2: Adaptive retrieval gate — skip Tavily when memory context is sufficient.
-
-    Gated by settings.use_retrieval_gate. When disabled, always proceeds to live search.
-    Sets state['retrieval_gate_needed'] which retrieval_gate_router reads.
-    """
-    if not settings.use_retrieval_gate:
-        return {"retrieval_gate_needed": True}
-
-    inp = state["input"]
-    memory_context = ""
-    if state.get("memory_results") and state["memory_results"].results:
-        from fact_check_agent.src.tools.rag_tool import format_rag_context
-        memory_context = format_rag_context(
-            [r.model_dump() for r in state["memory_results"].results]
-        )
-
-    prompt = IS_RETRIEVAL_NEEDED_PROMPT.format(claim_text=inp.claim_text)
-    if memory_context:
-        prompt += f"\n\nEXISTING CONTEXT FROM MEMORY:\n{memory_context}"
-
-    client = _llm_factory.make_llm_client()
-    try:
-        response = client.chat.completions.create(
-            model=_llm_factory.llm_model_name(),
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-        result = json.loads(response.choices[0].message.content)
-        needed = bool(result.get("retrieval_needed", True))
-        logger.info(
-            "retrieval_gate: retrieval_needed=%s reason=%s",
-            needed, result.get("reason", "")
-        )
-        return {"retrieval_gate_needed": needed}
-    except Exception as e:
-        logger.error("retrieval_gate failed: %s — defaulting to retrieval_needed=True", e)
-        return {"retrieval_gate_needed": True}
-
-
 # ── Node: multi_agent_debate (S4) ─────────────────────────────────────────────
 
 def multi_agent_debate(state: FactCheckState, settings) -> dict:
@@ -417,7 +345,7 @@ def multi_agent_debate(state: FactCheckState, settings) -> dict:
 
     inp            = state["input"]
     output         = state.get("output")
-    evidence_block = "\n\n".join(state["retrieved_chunks"]) or "No evidence retrieved."
+    evidence_block = _format_context_claims(state.get("context_claims") or [])
 
     client = _llm_factory.make_llm_client()
 
@@ -575,8 +503,13 @@ def emit_output(state: FactCheckState) -> dict:
         logger.error("emit_output reached with no output in state")
         return {}
 
-    updated = current_output.model_copy(update={
-        "last_verified_at":    state.get("last_verified_at"),
-        "revalidation_needed": bool(state.get("revalidation_needed")),
-    })
+    # Derive last_verified_at from the most recent fresh memory claim
+    fresh = state.get("fresh_context") or []
+    last_verified_at = None
+    for claim in fresh:
+        ts = claim.get("verified_at")
+        if ts and (last_verified_at is None or ts > last_verified_at):
+            last_verified_at = ts
+
+    updated = current_output.model_copy(update={"last_verified_at": last_verified_at})
     return {"output": updated}
