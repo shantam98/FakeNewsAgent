@@ -71,10 +71,25 @@ DATASET_ROOT = (
     Path(__file__).resolve().parents[3] / "datasets" / "Factify2" / "Factify 2"
 )
 SPLIT_PATHS = {
-    "train": DATASET_ROOT / "factify2_train" / "factify2" / "train.csv",
-    "val":   DATASET_ROOT / "factify2_train" / "factify2" / "val.csv",
-    "test":  DATASET_ROOT / "factify2_test"  / "test.csv",
+    "train":         DATASET_ROOT / "factify2_train" / "factify2" / "train.csv",
+    "val":           DATASET_ROOT / "factify2_train" / "factify2" / "val.csv",
+    "test":          DATASET_ROOT / "factify2_test"  / "test.csv",
+    "train_curated": DATASET_ROOT / "factify2_train" / "factify2" / "train_curated.csv",
+    "val_curated":   DATASET_ROOT / "factify2_train" / "factify2" / "val_curated.csv",
+    "test_curated":  DATASET_ROOT / "factify2_test"  / "test_curated.csv",
 }
+_LOCAL_IMAGE_MAPPING_PATH = DATASET_ROOT.parent / "url_to_local.json"
+
+
+def _load_url_mapping() -> dict:
+    """Load url→local_path mapping produced by prefetch_images.py, if present."""
+    if _LOCAL_IMAGE_MAPPING_PATH.exists():
+        import json as _json
+        with _LOCAL_IMAGE_MAPPING_PATH.open() as f:
+            mapping = _json.load(f)
+        logger.info("Loaded %d local image mappings from %s", len(mapping), _LOCAL_IMAGE_MAPPING_PATH)
+        return mapping
+    return {}
 
 
 # ── Dataset loader ────────────────────────────────────────────────────────────
@@ -89,7 +104,18 @@ def load_factify2(split: str, limit: Optional[int] = None) -> pd.DataFrame:
     df = df[df["document"].str.strip() != ""]
     if limit:
         df = df.head(limit)
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+
+    url_map = _load_url_mapping()
+    if url_map:
+        for col in ("claim_image", "document_image"):
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda u: url_map.get(str(u).strip(), u) if pd.notna(u) else u
+                )
+        logger.info("Applied local image path substitutions to '%s' split", split)
+
+    return df
 
 
 # ── Caption generation (Ollama VLM) ──────────────────────────────────────────
@@ -191,17 +217,16 @@ def build_fact_check_input(row: pd.Series, include_image: bool = True,
     document   = str(row.get("document", "")).strip()
     image_url  = str(row.get("claim_image", "")).strip() or None
 
-    # Truncate document to avoid token limit issues
-    evidence_chunk = f"[REFERENCE DOCUMENT]\n{document[:3000]}"
+    evidence_chunk = f"[REFERENCE DOCUMENT]\n{document}"
 
     # OCR text as additional context when present
     claim_ocr = str(row.get("Claim OCR", "")).strip()
     if claim_ocr and claim_ocr not in ("nan", " ", ""):
-        evidence_chunk += f"\n\n[CLAIM IMAGE OCR]\n{claim_ocr[:500]}"
+        evidence_chunk += f"\n\n[CLAIM IMAGE OCR]\n{claim_ocr}"
 
     doc_ocr = str(row.get("Document OCR", "")).strip()
     if doc_ocr and doc_ocr not in ("nan", " ", ""):
-        evidence_chunk += f"\n\n[DOCUMENT IMAGE OCR]\n{doc_ocr[:500]}"
+        evidence_chunk += f"\n\n[DOCUMENT IMAGE OCR]\n{doc_ocr}"
 
     # Derive source_url from claim_image domain or use placeholder
     source_url = "https://factify2.benchmark/unknown"
@@ -497,7 +522,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Factify2 benchmark for the Fact-Check Agent")
-    parser.add_argument("--split",    default="val", choices=["val", "train", "test"],
+    parser.add_argument("--split",    default="val", choices=["val", "train", "test", "val_curated", "test_curated", "train_curated"],
                         help="Dataset split to evaluate (default: val)")
     parser.add_argument("--limit",    type=int, default=200,
                         help="Max records to evaluate (default: 200; set 0 for full split)")
