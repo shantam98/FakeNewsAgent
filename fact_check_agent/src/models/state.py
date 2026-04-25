@@ -1,5 +1,4 @@
 """LangGraph state schema for the Fact-Check Agent graph."""
-from datetime import datetime
 from typing import Optional, TypedDict
 
 from fact_check_agent.src.models.schemas import (
@@ -14,30 +13,30 @@ class FactCheckState(TypedDict):
     input: FactCheckInput
 
     # ── Memory query results ──────────────────────────────────────────────────
-    memory_results: Optional[MemoryQueryResponse]  # None until query_memory runs
-    entity_context: list[dict]                     # from MemoryAgent.get_entity_context()
+    memory_results: Optional[MemoryQueryResponse]
+    entity_context: list[dict]
 
     # ── Freshness-tagged memory context ──────────────────────────────────────
-    fresh_context: list[dict]   # SimilarClaim dicts tagged as still-current
-    stale_context: list[dict]   # SimilarClaim dicts tagged as outdated
+    fresh_context: list[dict]
+    stale_context: list[dict]
 
     # ── Context claims (from context_claim_agent) ─────────────────────────────
-    # Each dict: {type, question, content, verdict, confidence, source}
     context_claims: list[dict]
 
     # ── Prefetched chunks (benchmark mode — Factify2 doc + OCR) ──────────────
     retrieved_chunks: list[str]
 
-    # ── Claim decomposition (S3) ──────────────────────────────────────────────
-    sub_claims: list[str]
+    # ── Neutral synthesis output (fed into Supporter + Skeptic) ──────────────
+    neutral_degrees: list[float]
+    neutral_reasoning: Optional[str]
 
-    # ── Multi-agent debate (S4) ───────────────────────────────────────────────
+    # ── Multi-agent debate ────────────────────────────────────────────────────
     debate_transcript: Optional[str]
 
     # ── Source credibility (from Reflection Agent) ────────────────────────────
-    source_credibility: Optional[dict]  # keys: credibility_mean, bias_mean, bias_std, sample_count
+    source_credibility: Optional[dict]
 
-    # ── Cross-modal ────────────────────────────────────────────────────────────
+    # ── Cross-modal ───────────────────────────────────────────────────────────
     cross_modal_flag: bool
     cross_modal_explanation: Optional[str]
     clip_similarity_score: Optional[float]
@@ -54,7 +53,8 @@ INITIAL_STATE: dict = {
     "stale_context":           [],
     "context_claims":          [],
     "retrieved_chunks":        [],
-    "sub_claims":              [],
+    "neutral_degrees":         [],
+    "neutral_reasoning":       None,
     "debate_transcript":       None,
     "source_credibility":      None,
     "cross_modal_flag":        False,

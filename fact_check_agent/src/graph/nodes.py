@@ -27,8 +27,9 @@ from fact_check_agent.src.models.schemas import (
 )
 from fact_check_agent.src.models.state import FactCheckState
 from fact_check_agent.src.prompts import (
-    ADVOCATE_PROMPT,
-    ARBITER_PROMPT,
+    JUDGE_PROMPT,
+    SKEPTIC_PROMPT,
+    SUPPORTER_PROMPT,
     VERDICT_SYNTHESIS_PROMPT,
 )
 
@@ -41,18 +42,15 @@ logger = logging.getLogger(__name__)
 # ── Node: receive_claim ───────────────────────────────────────────────────────
 
 def receive_claim(state: FactCheckState) -> dict:
-    """Initialise all mutable state fields; seed sub_claims from pre-decomposed queries."""
-    inp        = state["input"]
-    prefetched = list(inp.prefetched_chunks)
-    sub_claims = list(inp.queries)   # pre-decomposed by preprocessing; [] in single-claim mode
+    """Initialise all mutable state fields to defaults."""
+    inp = state["input"]
     return {
         "memory_results":          None,
         "entity_context":          [],
         "fresh_context":           [],
         "stale_context":           [],
         "context_claims":          [],
-        "retrieved_chunks":        prefetched,
-        "sub_claims":              sub_claims,
+        "retrieved_chunks":        list(inp.prefetched_chunks),
         "debate_transcript":       None,
         "source_credibility":      None,
         "cross_modal_flag":        False,
@@ -190,97 +188,118 @@ def freshness_check_all(state: FactCheckState, settings) -> dict:
 
 def context_claim_agent_node(state: FactCheckState, settings) -> dict:
     """Generate factual/counter-factual questions, check coverage, search gaps, compose claims."""
-    pre_queries = state.get("sub_claims") or []
     claims = context_claim_agent.run(
         claim_text        = state["input"].claim_text,
         fresh_context     = state.get("fresh_context", []),
         prefetched_chunks = state.get("retrieved_chunks", []),
         tavily_api_key    = settings.tavily_api_key,
-        pre_queries       = pre_queries or None,
     )
     return {"context_claims": claims}
 
 
 # ── Node: synthesize_verdict ──────────────────────────────────────────────────
 
-def _format_context_claims(context_claims: list[dict]) -> str:
-    """Render context_claims as a structured text block for the synthesis prompt."""
-    factual = [c for c in context_claims if c["type"] == "factual"]
-    counter = [c for c in context_claims if c["type"] == "counter_factual"]
-    memory  = [c for c in context_claims if c["type"] == "memory"]
+# Credibility assigned to claims by source when no stored confidence is available
+_SOURCE_CREDIBILITY: dict[str, float] = {
+    "tavily":     0.75,
+    "prefetched": 0.70,
+}
+_DEFAULT_CREDIBILITY = 0.65
 
+
+def _format_numbered_context_claims(context_claims: list[dict]) -> str:
+    """Render context_claims as a numbered list for the LLM — no credibility scores exposed."""
     lines: list[str] = []
-
-    if factual:
-        lines.append("[FACTUAL EVIDENCE] — supports claim being true")
-        for c in factual:
-            lines.append(f"• Q: {c['question']}")
-            lines.append(f"  ↳ {c['content']} [{c['source']}]")
-
-    if counter:
+    for i, c in enumerate(context_claims, 1):
+        if c["type"] == "memory":
+            prior = f" (prior verdict: {c['verdict']})" if c.get("verdict") else ""
+            lines.append(f"[{i}] MEMORY — prior verified claim{prior}")
+            lines.append(f"    \"{c['content']}\"")
+        else:
+            tag = "FACTUAL" if c["type"] == "factual" else "COUNTER-FACTUAL"
+            lines.append(f"[{i}] {tag} ({c['source']})")
+            if c.get("question"):
+                lines.append(f"    Q: {c['question']}")
+            lines.append(f"    Evidence: {c['content']}")
         lines.append("")
-        lines.append("[COUNTER-FACTUAL EVIDENCE] — challenges claim being true")
-        for c in counter:
-            lines.append(f"• Q: {c['question']}")
-            lines.append(f"  ↳ {c['content']} [{c['source']}]")
+    return "\n".join(lines).strip() or "No evidence available."
 
-    if memory:
-        lines.append("")
-        lines.append("[MEMORY CONTEXT] — prior verified claims (fresh)")
-        for c in memory:
-            verdict_str = ""
-            if c.get("verdict"):
-                conf = f" ({c['confidence']:.0%} confidence)" if c.get("confidence") else ""
-                verdict_str = f" → {c['verdict']}{conf}"
-            lines.append(f"• \"{c['content']}\"{verdict_str} [memory]")
 
-    return "\n".join(lines) if lines else "No evidence available."
+def _get_claim_credibility(claim: dict) -> float:
+    if claim["source"] == "memory" and claim.get("confidence") is not None:
+        return float(claim["confidence"])
+    return _SOURCE_CREDIBILITY.get(claim["source"], _DEFAULT_CREDIBILITY)
+
+
+_VALID_DEGREES = {1.0, 0.5, 0.0, -0.5, -1.0}
+
+
+def _compute_verdict(
+    context_claims: list[dict],
+    degrees: list[float],
+) -> tuple[str, int, float]:
+    """Compute verdict, confidence, and evidence volume via the formula:
+
+        V = Σ(Di × Ci) / Σ|Ci|
+
+    Di: signed degree of support (-1.0 to 1.0) returned by the LLM.
+    Ci: credibility of the source (memory confidence | tavily 0.75 | prefetched 0.70).
+
+    Verdict thresholds:  V > 0.5 → supported | V < -0.5 → refuted | else → misleading.
+
+    Confidence blends |V| (verdict strength) with a volume factor (Σ|Ci| / 2.5):
+    a single credible source is capped around 60 %; three or more can reach 97 %.
+
+    Returns: (verdict_label, confidence_0_100, evidence_volume=Σ|Ci|)
+    """
+    total_weighted    = 0.0
+    total_credibility = 0.0
+
+    for i, claim in enumerate(context_claims):
+        raw_d = degrees[i] if i < len(degrees) else 0.0
+        d = min(1.0, max(-1.0, float(raw_d)))   # clamp; snap to nearest valid value
+        c = _get_claim_credibility(claim)
+        total_weighted    += d * c
+        total_credibility += abs(c)
+
+    evidence_volume = total_credibility   # Σ|Ci| — how much evidence we have
+
+    if total_credibility == 0:
+        return "misleading", 50, 0.0
+
+    V = total_weighted / total_credibility  # [-1.0, 1.0]
+
+    if V > 0.5:
+        verdict = "supported"
+    elif V < -0.5:
+        verdict = "refuted"
+    else:
+        verdict = "misleading"
+
+    # Confidence = verdict strength × volume factor
+    # volume_factor → 1.0 as Σ|Ci| → 2.5 (≈ 3 tavily-credibility sources)
+    volume_factor = min(1.0, evidence_volume / 2.5)
+    confidence    = int(min(97, max(15, abs(V) * 100 * (0.4 + 0.6 * volume_factor))))
+
+    return verdict, confidence, evidence_volume
 
 
 def synthesize_verdict(state: FactCheckState, settings) -> dict:
-    """Synthesise a credibility-weighted verdict from structured context claims."""
+    """Synthesise a credibility-weighted verdict using V = Σ(Di×Ci) / Σ|Ci|.
+
+    The LLM assigns a signed Degree of Support Di ∈ {-1,-0.5,0,0.5,1} per claim
+    without seeing credibility scores. Python then computes V and derives the
+    verdict label + confidence from the formula.
+    """
     from fact_check_agent.src.id_utils import make_id
 
-    inp                  = state["input"]
-    context_claims       = state.get("context_claims") or []
-    context_claims_block = _format_context_claims(context_claims)
-
-    # Build source credibility note
-    cred_lines   = [f"Source: {inp.source_url}"]
-    sc           = state.get("source_credibility") or {}
-    cred_mean    = sc.get("credibility_mean")
-    bias_mean    = sc.get("bias_mean")
-    bias_std     = sc.get("bias_std")
-    sample_count = sc.get("sample_count", 0)
-
-    if cred_mean is not None and sample_count >= 2:
-        cred_lines.append(
-            f"Source credibility for this topic: {cred_mean:.0%} "
-            f"(based on {sample_count} past verdicts)"
-        )
-        cred_lines.append(
-            f"Source bias for this topic: {bias_mean:.2f} ± {bias_std:.2f} "
-            f"(0.0 = unbiased, 1.0 = highly biased; high std = inconsistent source)"
-        )
-    elif sample_count == 1:
-        cred_lines.append("Source credibility: only 1 prior verdict — insufficient for reliable estimate")
-    else:
-        cred_lines.append("Source credibility: no prior verdicts for this source")
-
-    if state["entity_context"]:
-        cred_lines.append("Entity credibility context:")
-        for e in state["entity_context"]:
-            cred_lines.append(
-                f"  - {e['name']} ({e['entity_type']}): "
-                f"credibility {e.get('current_credibility', 0.5):.2f}, "
-                f"sentiment in claim: {e.get('sentiment', 'neutral')}"
-            )
-    source_credibility_note = "\n".join(cred_lines)
+    inp            = state["input"]
+    context_claims = state.get("context_claims") or []
+    numbered_block = _format_numbered_context_claims(context_claims)
 
     prompt = VERDICT_SYNTHESIS_PROMPT.format(
         claim_text=inp.claim_text,
-        context_claims_block=context_claims_block,
-        source_credibility_note=source_credibility_note,
+        numbered_claims=numbered_block,
     )
 
     client = _llm_factory.make_llm_client()
@@ -294,120 +313,167 @@ def synthesize_verdict(state: FactCheckState, settings) -> dict:
         result = json.loads(response.choices[0].message.content)
     except Exception as e:
         logger.error("Verdict synthesis failed: %s", e)
-        result = {
-            "verdict": "misleading",
-            "confidence_score": 0,
-            "bias_score": 0.5,
-            "reasoning": f"Synthesis failed: {e}",
-            "evidence_links": [],
-        }
+        result = {"degrees": [], "reasoning": str(e)}
 
-    # Normalise verdict to the 3 valid labels — model sometimes outputs variants
-    _VALID_LABELS = {"supported", "refuted", "misleading"}
-    raw_verdict = str(result.get("verdict", "misleading")).lower().strip()
-    if raw_verdict not in _VALID_LABELS:
-        # Map common variants
-        if "support" in raw_verdict:
-            raw_verdict = "supported"
-        elif "refut" in raw_verdict or "contradict" in raw_verdict or "false" in raw_verdict:
-            raw_verdict = "refuted"
-        else:
-            raw_verdict = "misleading"
-        logger.warning("synthesize_verdict: non-standard label normalised to '%s'", raw_verdict)
-
-    output = FactCheckOutput(
-        verdict_id      = make_id("vrd_"),
-        claim_id        = inp.claim_id,
-        verdict         = raw_verdict,
-        confidence_score= int(result.get("confidence_score", 0)),
-        evidence_links  = result.get("evidence_links", []),
-        reasoning       = result.get("reasoning", ""),
-        bias_score      = float(result.get("bias_score", 0.5)),
-        cross_modal_flag= False,   # filled by cross_modal_check node
-        cross_modal_explanation=None,
-    )
+    degrees   = [float(x) for x in result.get("degrees", [])]
+    reasoning = result.get("reasoning", "")
+    verdict, confidence, evidence_volume = _compute_verdict(context_claims, degrees)
 
     logger.info(
-        "synthesize_verdict: %s (confidence=%d)", output.verdict, output.confidence_score
+        "synthesize_verdict: V-formula → %s (confidence=%d, evidence_volume=%.2f, degrees=%s)",
+        verdict, confidence, evidence_volume,
+        [round(d, 1) for d in degrees[:8]],
     )
-    return {"output": output}
+
+    output = FactCheckOutput(
+        verdict_id              = make_id("vrd_"),
+        claim_id                = inp.claim_id,
+        verdict                 = verdict,
+        confidence_score        = confidence,
+        evidence_links          = [],
+        reasoning               = reasoning,
+        cross_modal_flag        = False,
+        cross_modal_explanation = None,
+    )
+    return {
+        "output":           output,
+        "neutral_degrees":  degrees,
+        "neutral_reasoning": reasoning,
+    }
 
 
 # ── Node: multi_agent_debate (S4) ─────────────────────────────────────────────
 
+def _format_neutral_scores_block(context_claims: list[dict], degrees: list[float]) -> str:
+    """Render each evidence item with its Neutral Di for the Supporter/Skeptic/Judge."""
+    lines: list[str] = []
+    for i, claim in enumerate(context_claims, 1):
+        d = degrees[i - 1] if i - 1 < len(degrees) else 0.0
+        tag = {"memory": "MEMORY", "factual": "FACTUAL", "counter_factual": "COUNTER-FACTUAL"}.get(
+            claim["type"], claim["type"].upper()
+        )
+        lines.append(f"[{i}] {tag} | Neutral Di = {d:+.1f}")
+        if claim.get("question"):
+            lines.append(f"    Q: {claim['question']}")
+        lines.append(f"    \"{claim['content'][:200]}\"")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _parse_json_response(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip()
+    return json.loads(raw)
+
+
 def multi_agent_debate(state: FactCheckState, settings) -> dict:
-    """S4: Advocate/arbiter debate for low-confidence verdicts.
+    """S4: 4-role structured debate for low-confidence verdicts.
 
-    Gated by settings.use_debate + debate_confidence_threshold.
-    Two advocate agents argue for/against, an arbiter synthesises a final verdict.
+    Flow:
+      Role 1 — Neutral already ran (synthesize_verdict); degrees stored in state.
+      Role 2 — Supporter: proposes Di boosts where neutral was too conservative.
+      Role 3 — Skeptic:   proposes Di penalties where neutral missed flaws.
+               (Supporter and Skeptic run independently, only see Neutral output.)
+      Role 4 — Judge:     receives all three, outputs final Di per evidence item.
     """
-    from fact_check_agent.src.id_utils import make_id
-
-    inp            = state["input"]
-    output         = state.get("output")
-    evidence_block = _format_context_claims(state.get("context_claims") or [])
+    inp             = state["input"]
+    output          = state.get("output")
+    context_claims  = state.get("context_claims") or []
+    neutral_degrees = state.get("neutral_degrees") or []
+    numbered_block  = _format_numbered_context_claims(context_claims)
+    neutral_block   = _format_neutral_scores_block(context_claims, neutral_degrees)
 
     client = _llm_factory.make_llm_client()
+    model  = _llm_factory.llm_model_name()
 
     def _call(prompt_text: str) -> str:
         resp = client.chat.completions.create(
-            model=_llm_factory.llm_model_name(),
+            model=model,
             messages=[{"role": "user", "content": prompt_text}],
             temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()
+        raw = resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip()
+        return raw
 
     try:
-        for_prompt = ADVOCATE_PROMPT.format(
-            position="TRUE (supported)",
-            position_adj="supporting",
+        # ── Role 2: Supporter (independent of Skeptic) ────────────────────────
+        supporter_raw = _call(SUPPORTER_PROMPT.format(
             claim_text=inp.claim_text,
-            evidence_block=evidence_block,
-        )
-        against_prompt = ADVOCATE_PROMPT.format(
-            position="FALSE (refuted)",
-            position_adj="refuting",
+            numbered_claims=numbered_block,
+            neutral_scores_block=neutral_block,
+        ))
+        supporter_result = json.loads(supporter_raw)
+        supporter_adj = supporter_result.get("adjustments", [])
+
+        # ── Role 3: Skeptic (independent of Supporter) ────────────────────────
+        skeptic_raw = _call(SKEPTIC_PROMPT.format(
             claim_text=inp.claim_text,
-            evidence_block=evidence_block,
-        )
-
-        argument_for     = _call(for_prompt)
-        argument_against = _call(against_prompt)
-
-        arbiter_prompt = ARBITER_PROMPT.format(
-            claim_text=inp.claim_text,
-            argument_for=argument_for,
-            argument_against=argument_against,
-        )
-        arbiter_raw = _call(arbiter_prompt)
-
-        # Strip markdown fences if present
-        if arbiter_raw.startswith("```"):
-            arbiter_raw = arbiter_raw.split("```")[1]
-            if arbiter_raw.startswith("json"):
-                arbiter_raw = arbiter_raw[4:]
-        result = json.loads(arbiter_raw)
-
-        transcript = (
-            f"=== FOR (supported) ===\n{argument_for}\n\n"
-            f"=== AGAINST (refuted) ===\n{argument_against}\n\n"
-            f"=== ARBITER ===\n{arbiter_raw}"
-        )
-
-        if output:
-            updated_output = output.model_copy(update={
-                "verdict":          result.get("verdict", output.verdict),
-                "confidence_score": int(result.get("confidence_score", output.confidence_score)),
-                "bias_score":       float(result.get("bias_score", output.bias_score)),
-                "reasoning":        result.get("reasoning", output.reasoning),
-                "evidence_links":   result.get("evidence_links", output.evidence_links),
-            })
-        else:
-            updated_output = output
+            numbered_claims=numbered_block,
+            neutral_scores_block=neutral_block,
+        ))
+        skeptic_result = json.loads(skeptic_raw)
+        skeptic_adj = skeptic_result.get("adjustments", [])
 
         logger.info(
-            "multi_agent_debate: verdict=%s confidence=%d",
-            result.get("verdict"), result.get("confidence_score"),
+            "multi_agent_debate: supporter proposed %d adjustments, skeptic proposed %d",
+            len(supporter_adj), len(skeptic_adj),
+        )
+
+        # ── Role 4: Judge ─────────────────────────────────────────────────────
+        judge_raw = _call(JUDGE_PROMPT.format(
+            claim_text=inp.claim_text,
+            numbered_claims=numbered_block,
+            neutral_scores_block=neutral_block,
+            supporter_adjustments=supporter_raw,
+            skeptic_adjustments=skeptic_raw,
+        ))
+        judge_result = json.loads(judge_raw)
+
+        # Extract final Di per evidence item from Judge's output
+        final_scores = {
+            item["evidence_id"]: float(item["final_D"])
+            for item in judge_result.get("final_scores", [])
+        }
+        stalemates = sum(
+            1 for item in judge_result.get("final_scores", []) if item.get("stalemate")
+        )
+
+        # Map back to ordered list aligned with context_claims
+        final_degrees = [
+            final_scores.get(i + 1, neutral_degrees[i] if i < len(neutral_degrees) else 0.0)
+            for i in range(len(context_claims))
+        ]
+
+        verdict, confidence, evid_volume = _compute_verdict(context_claims, final_degrees)
+
+        # Lower confidence if many stalemates
+        if stalemates > 0:
+            stalemate_penalty = min(15, stalemates * 5)
+            confidence = max(15, confidence - stalemate_penalty)
+
+        transcript = (
+            f"=== NEUTRAL (initial Di) ===\n{neutral_block}\n\n"
+            f"=== SUPPORTER ===\n{supporter_raw}\n\n"
+            f"=== SKEPTIC ===\n{skeptic_raw}\n\n"
+            f"=== JUDGE ===\n{judge_raw}"
+        )
+
+        debate_summary = judge_result.get("debate_summary", "")
+        reasoning = f"{debate_summary}\n\n[Debate: {len(supporter_adj)} boosts, {len(skeptic_adj)} penalties, {stalemates} stalemates]"
+
+        updated_output = output.model_copy(update={
+            "verdict":          verdict,
+            "confidence_score": confidence,
+            "reasoning":        reasoning,
+        }) if output else output
+
+        logger.info(
+            "multi_agent_debate: verdict=%s confidence=%d (stalemates=%d, "
+            "supporter_adj=%d, skeptic_adj=%d)",
+            verdict, confidence, stalemates, len(supporter_adj), len(skeptic_adj),
         )
         return {"output": updated_output, "debate_transcript": transcript}
 
@@ -472,7 +538,7 @@ def write_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
         label           = output.verdict,
         confidence      = output.confidence_score / 100,
         evidence_summary= evidence_summary,
-        bias_score      = output.bias_score,
+        bias_score      = 0.0,
         image_mismatch  = output.cross_modal_flag,
         verified_at     = datetime.now(timezone.utc),
     )
@@ -487,7 +553,7 @@ def write_memory(state: FactCheckState, memory: "MemoryAgent") -> dict:
         verdict_id      = output.verdict_id,
         verdict_label   = output.verdict,
         confidence_score= output.confidence_score,
-        bias_score      = output.bias_score,
+        bias_score      = 0.0,
         memory          = memory,
     )
 

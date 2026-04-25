@@ -59,7 +59,10 @@ def _check_freshness_single(
         response_format={"type": "json_object"},
         temperature=0,
     )
-    return json.loads(response.choices[0].message.content)
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip()
+    return json.loads(raw)
 
 
 def _check_freshness_react(

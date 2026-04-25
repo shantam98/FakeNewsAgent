@@ -57,7 +57,6 @@ class FactCheckOutput(BaseModel):
     confidence_score: int = Field(ge=0, le=100)   # 0–100 int for API; stored as float/100 in memory
     evidence_links: list[str]         # source URLs supporting the verdict
     reasoning: str                    # chain-of-thought explanation
-    bias_score: float = Field(ge=0.0, le=1.0)
     cross_modal_flag: bool = False
     cross_modal_explanation: Optional[str] = None  # one sentence; None if no image or no conflict
     last_verified_at: Optional[datetime] = None    # verified_at of the most recent fresh memory match

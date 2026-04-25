@@ -304,6 +304,82 @@ def compute_metrics(records: list[dict]) -> dict:
     }
 
 
+def _run_factify2_verdict_pipeline(
+    claim_text: str,
+    prefetched_chunks: list[str],
+) -> tuple[str, int, str]:
+    """Lightweight Factify2 verdict pipeline.
+
+    Document chunks → factual/counter-factual Q&A → VERDICT_SYNTHESIS_PROMPT →
+    simple unweighted Di average → Factify label.
+
+    Bypasses freshness check, Tavily, memory, and source credibility weighting
+    since all evidence comes from the same prefetched document.
+
+    Returns: (verdict_label, confidence_0_100, reasoning)
+    """
+    from fact_check_agent.src.agents import context_claim_agent
+    from fact_check_agent.src.graph.nodes import _format_numbered_context_claims
+    from fact_check_agent.src.prompts import VERDICT_SYNTHESIS_PROMPT
+    import fact_check_agent.src.llm_factory as _llm_factory
+
+    # Step 1–3: generate questions + extract answers from document
+    claims = context_claim_agent.run(
+        claim_text        = claim_text,
+        fresh_context     = [],
+        prefetched_chunks = prefetched_chunks,
+        tavily_api_key    = "",
+    )
+
+    if not claims:
+        return "misleading", 50, "No evidence extracted from document."
+
+    # Step 4: verdict synthesis
+    numbered_block = _format_numbered_context_claims(claims)
+    prompt = VERDICT_SYNTHESIS_PROMPT.format(
+        claim_text      = claim_text,
+        numbered_claims = numbered_block,
+    )
+
+    model  = _llm_factory.llm_model_name()
+    client = _llm_factory.make_llm_client()
+    try:
+        response = client.chat.completions.create(
+            model           = model,
+            messages        = [{"role": "user", "content": prompt}],
+            response_format = {"type": "json_object"},
+            temperature     = 0,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip()
+        result = json.loads(raw)
+    except Exception as e:
+        return "misleading", 50, f"Verdict synthesis failed: {e}"
+
+    degrees  = [float(x) for x in result.get("degrees", [])]
+    reasoning = result.get("reasoning", "")
+
+    if not degrees:
+        return "misleading", 50, reasoning or "No degrees returned."
+
+    # Step 5: simple unweighted average → Factify label
+    V = sum(degrees) / len(degrees)
+
+    if V > 0.2:
+        verdict = "supported"
+    elif V < -0.2:
+        verdict = "refuted"
+    else:
+        verdict = "misleading"
+
+    # Confidence from |V| scaled by how many questions returned evidence
+    volume_factor = min(1.0, len(degrees) / 6.0)   # 6 = full question set
+    confidence = int(min(97, max(15, abs(V) * 100 * (0.4 + 0.6 * volume_factor))))
+
+    return verdict, confidence, reasoning
+
+
 def print_metrics(metrics: dict, settings_snapshot: dict) -> None:
     print("\n" + "=" * 60)
     print("FACTIFY2 BENCHMARK RESULTS")
@@ -338,11 +414,14 @@ def run_benchmark(
     limit: Optional[int] = 200,
     output_path: Optional[str] = None,
     include_image: bool = True,
+    data_path: Optional[str] = None,
 ) -> dict:
     """Run the benchmark and return metrics dict.
 
     All inference is local (Ollama). Document is injected directly as evidence
     (Option A) so Tavily is never called.
+
+    data_path: if set, load from this TSV file instead of the standard Factify2 split.
     """
     # Bootstrap path resolution for memory_agent imports
     _root = Path(__file__).resolve().parents[3]
@@ -363,8 +442,6 @@ def run_benchmark(
         os.environ.setdefault(key, default)
 
     from fact_check_agent.src.config import settings
-    from fact_check_agent.src.graph.graph import build_graph
-    from fact_check_agent.src.memory_client import get_memory
 
     settings_snapshot = {
         "llm_provider":            settings.llm_provider,
@@ -379,8 +456,18 @@ def run_benchmark(
         "limit":                   limit,
     }
 
-    print(f"\nLoading Factify2 {split} split (limit={limit})...")
-    df = load_factify2(split, limit)
+    if data_path:
+        print(f"\nLoading dataset from {data_path} (limit={limit})...")
+        df = pd.read_csv(data_path, sep="\t", engine="python", on_bad_lines="skip")
+        df = df.dropna(subset=["claim", "document"])
+        df = df[df["claim"].str.strip() != ""]
+        df = df[df["document"].str.strip() != ""]
+        if limit:
+            df = df.head(limit)
+        df = df.reset_index(drop=True)
+    else:
+        print(f"\nLoading Factify2 {split} split (limit={limit})...")
+        df = load_factify2(split, limit)
     print(f"  {len(df)} records loaded")
 
     # Pre-generate VLM captions if a vision model is configured and images are enabled.
@@ -391,37 +478,6 @@ def run_benchmark(
         print(f"\nPre-generating image captions (VLM: {settings.ollama_vlm_model})...")
         caption_cache = generate_captions_for_df(df, settings.ollama_vlm_model, settings.ollama_base_url)
         print(f"  {sum(1 for v in caption_cache.values() if v)} captions available")
-
-    if settings.offline_mode:
-        print("Offline mode — skipping MemoryAgent connection")
-        from unittest.mock import MagicMock
-        memory = MagicMock()
-        memory.search_similar_claims.return_value = {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-        memory.get_entity_context.return_value = []
-        memory.get_entity_ids_for_claims.return_value = []
-        memory.get_graph_claims_for_entities.return_value = []
-        memory.get_verdict_by_claim.return_value = {"ids": [], "metadatas": []}
-        memory.add_verdict.return_value = None
-        memory.query_source_credibility.return_value = {"distances": [[]], "metadatas": [[]]}
-        memory.add_source_credibility_point.return_value = None
-    else:
-        print("Connecting to MemoryAgent...")
-        try:
-            memory = get_memory()
-        except Exception as e:
-            print(f"  WARNING: MemoryAgent unavailable ({e}). Running without memory (no cache path).")
-            from unittest.mock import MagicMock
-            memory = MagicMock()
-            memory.search_similar_claims.return_value = {"ids": [[]], "documents": [[]], "distances": [[]], "metadatas": [[]]}
-            memory.get_entity_context.return_value = []
-            memory.get_entity_ids_for_claims.return_value = []
-            memory.get_graph_claims_for_entities.return_value = []
-            memory.get_verdict_by_claim.return_value = {"ids": [], "metadatas": []}
-            memory.add_verdict.return_value = None
-            memory.query_source_credibility.return_value = {"distances": [[]], "metadatas": [[]]}
-            memory.add_source_credibility_point.return_value = None
-
-    graph = build_graph(memory)
 
     results: list[dict] = []
     n_errors = 0
@@ -441,16 +497,14 @@ def run_benchmark(
             print(f"   {fact_input.claim_text[:100]}{'…' if len(fact_input.claim_text) > 100 else ''}")
 
             t_claim = time.time()
-            state = graph.invoke({"input": fact_input})
-            output = state.get("output")
-
-            claim_elapsed = time.time() - t_claim
-            pred_verdict    = output.verdict          if output else None
-            confidence      = output.confidence_score if output else None
-            cross_modal_flag= output.cross_modal_flag if output else False
-            cross_modal_exp = output.cross_modal_explanation if output else None
-            reasoning       = output.reasoning        if output else ""
-            bias_score      = output.bias_score       if output else None
+            pred_verdict, confidence, reasoning = _run_factify2_verdict_pipeline(
+                claim_text        = fact_input.claim_text,
+                prefetched_chunks = list(fact_input.prefetched_chunks),
+            )
+            claim_elapsed    = time.time() - t_claim
+            cross_modal_flag = False
+            cross_modal_exp  = None
+            bias_score       = None
             correct_mark = "✓" if pred_verdict == true_verdict else "✗"
             print(f"   {correct_mark} pred={pred_verdict}  true={true_verdict}  conf={confidence}  {claim_elapsed:.1f}s")
 
@@ -534,6 +588,8 @@ def main():
                         help="Skip all DB writes (ChromaDB + Neo4j) — benchmark only")
     parser.add_argument("--offline", action="store_true",
                         help="Skip all DB reads+writes — no Docker needed, implies --dry-run")
+    parser.add_argument("--data-path", default=None,
+                        help="Path to a custom TSV dataset (overrides --split)")
     args = parser.parse_args()
 
     if args.offline:
@@ -548,6 +604,7 @@ def main():
         limit        = limit,
         output_path  = args.out,
         include_image= not args.no_image,
+        data_path    = args.data_path,
     )
 
 

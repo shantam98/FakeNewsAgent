@@ -34,24 +34,35 @@ logger = logging.getLogger(__name__)
 
 # ── Step 1: question generation ───────────────────────────────────────────────
 
+def _parse_json(raw: str) -> dict:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].lstrip("json").strip()
+    return json.loads(raw)
+
+
 def _generate_questions(claim_text: str, model: str, client) -> dict[str, list[str]]:
     prompt = QUESTION_GENERATION_PROMPT.format(claim_text=claim_text)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-        result = json.loads(resp.choices[0].message.content)
-        factual   = [str(q) for q in result.get("factual", [])[:3]]
-        counter   = [str(q) for q in result.get("counter_factual", [])[:3]]
-        logger.info("context_claim_agent: generated %d factual + %d counter-factual questions",
-                    len(factual), len(counter))
-        return {"factual": factual, "counter_factual": counter}
-    except Exception as exc:
-        logger.warning("question generation failed: %s", exc)
-        return {"factual": [], "counter_factual": []}
+    last_exc: Exception = RuntimeError("no attempts made")
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            result  = _parse_json(resp.choices[0].message.content or "")
+            factual = [str(q) for q in result.get("factual", [])[:3]]
+            counter = [str(q) for q in result.get("counter_factual", [])[:3]]
+            logger.info("context_claim_agent: generated %d factual + %d counter-factual questions",
+                        len(factual), len(counter))
+            return {"factual": factual, "counter_factual": counter}
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("question generation attempt %d/3 failed: %s", attempt + 1, exc)
+    logger.error("question generation failed after 3 attempts: %s", last_exc)
+    return {"factual": [], "counter_factual": []}
 
 
 # ── Step 2: coverage check ────────────────────────────────────────────────────
@@ -62,7 +73,7 @@ def _format_context_for_coverage(fresh_context: list[dict], prefetched_chunks: l
         verdict_str = f" (verdict: {claim['verdict_label']})" if claim.get("verdict_label") else ""
         parts.append(f"[MEMORY] {claim['claim_text']}{verdict_str}")
     for chunk in prefetched_chunks:
-        parts.append(f"[DOCUMENT] {chunk[:800]}")
+        parts.append(f"[DOCUMENT] {chunk[:40000]}")
     return "\n\n".join(parts) or "No context available."
 
 
@@ -90,7 +101,7 @@ def _check_coverage(
             response_format={"type": "json_object"},
             temperature=0,
         )
-        result   = json.loads(resp.choices[0].message.content)
+        result   = _parse_json(resp.choices[0].message.content or "")
         coverage = result.get("coverage", [])
         answered = sum(1 for c in coverage if c.get("answered"))
         logger.info("context_claim_agent: %d/%d questions answered by context",
@@ -109,11 +120,16 @@ def _summarise_search(
     search_text: str,
     model: str,
     client,
-) -> Optional[str]:
+) -> Optional[dict]:
+    """Extract a context claim from search text.
+
+    Returns {"summary": str, "source_name": str|None, "timestamp": str|None}
+    or None if no relevant information found.
+    """
     prompt = TAVILY_SUMMARY_PROMPT.format(
         claim_text=claim_text,
         question=question,
-        search_results=search_text[:2000],
+        search_results=search_text[:40000],
     )
     try:
         resp = client.chat.completions.create(
@@ -122,10 +138,16 @@ def _summarise_search(
             response_format={"type": "json_object"},
             temperature=0,
         )
-        result = json.loads(resp.choices[0].message.content)
-        return result.get("summary") or None
+        result = _parse_json(resp.choices[0].message.content or "")
+        if not result.get("summary"):
+            return None
+        return {
+            "summary":     result["summary"],
+            "source_name": result.get("source_name") or None,
+            "timestamp":   result.get("timestamp") or None,
+        }
     except Exception as exc:
-        logger.warning("tavily summarisation failed: %s", exc)
+        logger.warning("evidence extraction failed: %s", exc)
         return None
 
 
@@ -136,26 +158,16 @@ def run(
     fresh_context: list[dict],
     prefetched_chunks: list[str],
     tavily_api_key: str,
-    pre_queries: list[str] | None = None,
 ) -> list[dict]:
-    """Run the context claim agent. Returns a list of context_claim dicts.
-
-    pre_queries: pre-decomposed sub-claims from preprocessing. When provided,
-    question generation is skipped and these are used directly as factual questions.
-    """
+    """Run the context claim agent. Returns a list of context_claim dicts."""
     from fact_check_agent.src.tools.live_search_tool import format_search_context, search_live
 
     model  = _llm_factory.llm_model_name()
     client = _llm_factory.make_llm_client()
 
-    # Step 1 — use pre-provided queries or generate fresh ones
-    if pre_queries:
-        questions     = {"factual": list(pre_queries), "counter_factual": []}
-        all_questions = list(pre_queries)
-        logger.info("context_claim_agent: using %d pre-decomposed queries (skipping generation)", len(pre_queries))
-    else:
-        questions     = _generate_questions(claim_text, model, client)
-        all_questions = questions["factual"] + questions["counter_factual"]
+    # Step 1 — generate 3 factual + 3 counter-factual questions
+    questions     = _generate_questions(claim_text, model, client)
+    all_questions = questions["factual"] + questions["counter_factual"]
 
     # Step 2 — check coverage against memory + prefetched document
     coverage = _check_coverage(
@@ -168,12 +180,15 @@ def run(
     # Always include fresh memory claims
     for claim in fresh_context:
         context_claims.append({
-            "type":       "memory",
-            "question":   None,
-            "content":    claim.get("claim_text", ""),
-            "verdict":    claim.get("verdict_label"),
-            "confidence": claim.get("verdict_confidence"),
-            "source":     "memory",
+            "type":        "memory",
+            "question":    None,
+            "content":     claim.get("claim_text", ""),
+            "source_name": None,
+            "timestamp":   None,
+            "verdict":     claim.get("verdict_label"),
+            "confidence":  claim.get("verdict_confidence"),
+            "source":      "memory",
+            "source_url":  None,
         })
 
     # For each question: if unanswered → search; if answered → note is already in memory/prefetched
@@ -184,43 +199,63 @@ def run(
         if item.get("answered") and item.get("evidence"):
             # Already answered by existing context — add as a lightweight claim
             context_claims.append({
-                "type":       q_type,
-                "question":   q,
-                "content":    item["evidence"],
-                "verdict":    None,
-                "confidence": None,
-                "source":     "memory" if fresh_context else "prefetched",
+                "type":        q_type,
+                "question":    q,
+                "content":     item["evidence"],
+                "source_name": None,
+                "timestamp":   None,
+                "verdict":     None,
+                "confidence":  None,
+                "source":      "memory" if fresh_context else "prefetched",
+                "source_url":  None,
             })
             continue
 
-        # Unanswered — need to search
-        search_text = ""
-        source_tag  = "tavily"
-
+        # Unanswered — need to search / extract
         if prefetched_chunks:
-            # Benchmark / offline mode: extract from prefetched document text
-            search_text = "\n".join(prefetched_chunks)[:3000]
-            source_tag  = "prefetched"
+            search_text = "\n".join(prefetched_chunks)[:40000]
+            extracted = _summarise_search(q, claim_text, search_text, model, client)
+            if extracted:
+                context_claims.append({
+                    "type":        q_type,
+                    "question":    q,
+                    "content":     extracted["summary"],
+                    "source_name": extracted["source_name"],
+                    "timestamp":   extracted["timestamp"],
+                    "verdict":     None,
+                    "confidence":  None,
+                    "source":      "prefetched",
+                    "source_url":  None,
+                })
+
         elif tavily_api_key:
             try:
-                results     = search_live(q, api_key=tavily_api_key)
-                search_text, _ = format_search_context(results)
+                results      = search_live(q, api_key=tavily_api_key)
+                high_quality = [r for r in results if (r.get("score") or 0) >= 0.9]
+                logger.info(
+                    "context_claim_agent: %d/%d Tavily results pass score≥0.9 for %r",
+                    len(high_quality), len(results), q[:60],
+                )
+                for result in high_quality:
+                    content  = (result.get("content") or result.get("snippet") or "")[:40000]
+                    url      = result.get("url", "")
+                    title    = result.get("title", "")
+                    src_text = f"Source: {title}\nURL: {url}\n\n{content}"
+                    extracted = _summarise_search(q, claim_text, src_text, model, client)
+                    if extracted:
+                        context_claims.append({
+                            "type":        q_type,
+                            "question":    q,
+                            "content":     extracted["summary"],
+                            "source_name": extracted["source_name"] or title or None,
+                            "timestamp":   extracted["timestamp"],
+                            "verdict":     None,
+                            "confidence":  None,
+                            "source":      "tavily",
+                            "source_url":  url,
+                        })
             except Exception as exc:
                 logger.warning("Tavily search failed for %r: %s", q, exc)
-
-        if not search_text:
-            continue
-
-        summary = _summarise_search(q, claim_text, search_text, model, client)
-        if summary:
-            context_claims.append({
-                "type":       q_type,
-                "question":   q,
-                "content":    summary,
-                "verdict":    None,
-                "confidence": None,
-                "source":     source_tag,
-            })
 
     logger.info(
         "context_claim_agent: %d context claims (%d memory, %d factual, %d counter-factual)",
